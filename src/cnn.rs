@@ -1,7 +1,7 @@
 use crate::plan::{Op, Plan};
 use anyhow::{Result, ensure};
-use hrx::loom::{
-    Specialization,
+use hrx::{
+    loom::Specialization,
     model::{Command, Dispatch, KernelId, ModelSession, Region},
 };
 use std::collections::HashMap;
@@ -201,8 +201,7 @@ fn specification(l: &Op) -> (&'static str, Specialization) {
     };
     let mut spec = Specialization::new(symbol);
     let mut put = |name: &str, value: usize| {
-        spec.config
-            .insert(format!("{namespace}.{name}"), value.to_string());
+        spec.set_config(format!("{namespace}.{name}"), value.to_string());
     };
     match l.kind {
         "convert" => put("size", SIZE),

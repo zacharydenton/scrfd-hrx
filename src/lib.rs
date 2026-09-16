@@ -164,7 +164,7 @@ impl Scrfd {
 #[cfg(test)]
 mod tests;
 
-pub use hrx::loom::model::{Distribution, ForwardTimings};
+pub use hrx::{benchmark::Distribution, model::ForwardTimings};
 
 #[cfg(test)]
 mod reference;

@@ -9,17 +9,13 @@ repository = "https://github.com/zacharydenton/scrfd-hrx"
 include = ["src/**", "kernels/**", "tests/**", "docs/**", "Cargo.toml", "Cargo.lock", "README.md", "CHANGELOG.md", "LICENSE", "THIRD_PARTY_NOTICES.md"]
 
 [dependencies]
-hf-hub = { version = "1.0", default-features = false, features = ["blocking", "rustls-tls"] }
-hrx = { package = "hrx-rs", version = "0.4.1", default-features = false, features = ["download", "loom"] }
+hrx = { package = "hrx-rs", version = "0.5.0", default-features = false, features = ["download", "loom"] }
 anyhow = "1"
 half = { version = "2", features = ["bytemuck"] }
 bytemuck = "1"
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-onnx-protobuf = "0.2.3"
-# onnx-protobuf 0.2.3 generated bindings require this runtime version.
-protobuf = "=3.4.0"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 
 fast_image_resize = "=5.1.4"
@@ -27,3 +23,6 @@ fast_image_resize = "=5.1.4"
 [dev-dependencies]
 tempfile = "3"
 matrixmultiply = "0.3"
+onnx-protobuf = "0.2.3"
+# Test fixtures use the generated ONNX protobuf API directly.
+protobuf = "=3.4.0"

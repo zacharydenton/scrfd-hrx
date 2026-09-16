@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Use HRX 0.5's shared Hugging Face resolver, checked ONNX loader, scratch
+  planner, compiler selection, and top-level `hrx::model` API.
 - Reject unsupported SCRFD head pipelines and invalid tensor ranks during model loading instead of silently changing scores or panicking.
 - Accept RGB throughout: rename `Image::bgr` to `Image::rgb` and pass RGB canvases to `detect_letterboxed`. BGR callers must swap red and blue before calling.
 - Normalize and pad each input pixel with one vector store in the GPU preprocessing kernel.

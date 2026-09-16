@@ -1,5 +1,5 @@
 use crate::{
-    onnx::{Network, Node, NodeExt, TensorExt},
+    onnx::{Network, Node},
     plan::*,
 };
 use anyhow::{Context, Result, ensure};
@@ -10,24 +10,18 @@ use std::{
 pub(crate) fn load(path: &Path) -> Result<Plan> {
     let net = Network::load(path, 640)?;
     ensure!(
-        net.graph.output.len() == 9
-            && net
-                .graph
-                .node
-                .iter()
-                .filter(|n| n.op_type == "Conv")
-                .count()
-                == 58,
+        net.outputs().len() == 9
+            && net.nodes().iter().filter(|n| n.op_type() == "Conv").count() == 58,
         "expected det_10g graph"
     );
     let mut heads: HashMap<String, HashMap<usize, usize>> = HashMap::new();
-    for (i, n) in net.graph.node.iter().enumerate() {
-        if n.op_type == "Conv" {
-            let co = net.tensor(&n.input[1])?.shape()?[0];
+    for (i, n) in net.nodes().iter().enumerate() {
+        if n.op_type() == "Conv" {
+            let co = net.tensor(&n.inputs()[1])?.shape()?[0];
             if [2, 8, 20].contains(&co) {
                 ensure!(
                     heads
-                        .entry(n.input[0].clone())
+                        .entry(n.inputs()[0].clone())
                         .or_default()
                         .insert(co, i)
                         .is_none(),
@@ -48,22 +42,22 @@ pub(crate) fn load(path: &Path) -> Result<Plan> {
     let mut head_outputs = HashSet::new();
     for group in heads.values() {
         for (&channels, &i) in group {
-            let (output, scale) = validate_head(&net, &net.graph.node[i], channels, &mut fused)?;
+            let (output, scale) = validate_head(&net, &net.nodes()[i], channels, &mut fused)?;
             ensure!(head_outputs.insert(output), "duplicate head output");
             head_scales.insert(i, scale);
         }
     }
-    let declared_outputs: HashSet<_> = net.graph.output.iter().map(|v| v.name.clone()).collect();
+    let declared_outputs: HashSet<_> = net.outputs().iter().cloned().collect();
     ensure!(
         head_outputs == declared_outputs,
         "expected only SCRFD head outputs"
     );
     let mut weights = HashMap::new();
-    let mut aliases = HashMap::from([(net.graph.input[0].name.clone(), "nhwc_input".into())]);
+    let mut aliases = HashMap::from([(net.inputs()[0].clone(), "nhwc_input".into())]);
     let mut ops = vec![Op {
         kind: "convert",
         name: "convert".into(),
-        src: net.graph.input[0].name.clone(),
+        src: net.inputs()[0].clone(),
         dst: "nhwc_input".into(),
         h: 640,
         w: 640,
@@ -73,47 +67,48 @@ pub(crate) fn load(path: &Path) -> Result<Plan> {
         ..Default::default()
     }];
     let mut index = 0;
-    for (i, node) in net.graph.node.iter().enumerate() {
-        match node.op_type.as_str() {
+    for (i, node) in net.nodes().iter().enumerate() {
+        match node.op_type() {
             "Conv" => {
                 let name = format!("c{index:02}");
                 index += 1;
                 if members.contains(&i) {
                     continue;
                 }
-                let sh = net.tensor(&node.input[1])?.shape()?;
+                let sh = net.tensor(&node.inputs()[1])?.shape()?;
                 let (co, ci, taps) = (sh[0], sh[1], sh[2] * sh[3]);
                 let mut variant = "plain";
                 let mut extra = String::new();
-                let mut output = node.out();
+                let mut output = node.output()?;
+                let node_output = node.output()?;
                 if let Some(add) = net
-                    .consumers(node.out())
-                    .find(|n| n.op_type == "Add" && n.input[0] == node.out())
+                    .consumers(node_output)
+                    .find(|n| n.op_type() == "Add" && n.inputs()[0] == node_output)
                 {
                     ensure!(
-                        net.consumers(node.out()).count() == 1,
+                        net.consumers(node.output()?).count() == 1,
                         "unfused conv consumer"
                     );
                     let other = net
-                        .producer(&add.input[1])
+                        .producer(&add.inputs()[1])
                         .context("missing residual producer")?;
-                    if other.op_type == "Resize" {
+                    if other.op_type() == "Resize" {
                         ensure!(
-                            net.consumers(other.out()).count() == 1,
+                            net.consumers(other.output()?).count() == 1,
                             "unfused Resize consumer"
                         );
                         variant = "add_resized";
-                        extra = other.input[0].clone();
-                        fused.insert(other.out().to_string());
+                        extra = other.inputs()[0].clone();
+                        fused.insert(other.output()?.to_string());
                     } else {
                         variant = "add";
-                        extra = add.input[1].clone();
+                        extra = add.inputs()[1].clone();
                     }
-                    fused.insert(add.out().to_string());
-                    output = add.out();
-                    aliases.insert(add.out().into(), node.out().into());
+                    fused.insert(add.output()?.to_string());
+                    output = add.output()?;
+                    aliases.insert(add.output()?.into(), node.output()?.into());
                 }
-                if let Some(relu) = net.consumers(output).find(|n| n.op_type == "Relu") {
+                if let Some(relu) = net.consumers(output).find(|n| n.op_type() == "Relu") {
                     ensure!(
                         variant != "add_resized" && net.consumers(output).count() == 1,
                         "unsupported ReLU fusion"
@@ -123,10 +118,10 @@ pub(crate) fn load(path: &Path) -> Result<Plan> {
                     } else {
                         "relu_add"
                     };
-                    fused.insert(relu.out().to_string());
-                    aliases.insert(relu.out().into(), node.out().into());
+                    fused.insert(relu.output()?.to_string());
+                    aliases.insert(relu.output()?.into(), node.output()?.into());
                 }
-                let stride = node.ints("strides", &[1, 1])[0] as usize;
+                let stride = node.integers("strides", &[1, 1])[0] as usize;
                 ensure!(
                     (taps == 9 && variant != "add_resized")
                         || (taps == 1
@@ -141,7 +136,7 @@ pub(crate) fn load(path: &Path) -> Result<Plan> {
                     &mut weights,
                     name.clone(),
                     &pack(
-                        &net.tensor(&node.input[1])?.floats()?,
+                        &net.tensor(&node.inputs()[1])?.f64s()?,
                         co,
                         ci,
                         taps,
@@ -151,16 +146,16 @@ pub(crate) fn load(path: &Path) -> Result<Plan> {
                     ),
                 );
                 let mut bias = vec![0.; n];
-                bias[..co].copy_from_slice(&net.tensor(&node.input[2])?.floats()?);
+                bias[..co].copy_from_slice(&net.tensor(&node.inputs()[2])?.f64s()?);
                 emit32(&mut weights, format!("{name}_b"), &bias);
-                let s = net.shape(&node.input[0])?;
-                let out = net.shape(node.out())?;
+                let s = net.shape(&node.inputs()[0])?;
+                let out = net.shape(node.output()?)?;
                 ops.push(Op {
                     kind: if taps == 9 { "conv" } else { "matmul" },
                     variant,
                     name,
-                    src: node.input[0].clone(),
-                    dst: node.out().into(),
+                    src: node.inputs()[0].clone(),
+                    dst: node.output()?.into(),
                     extra,
                     h: s[2],
                     w: s[3],
@@ -184,19 +179,19 @@ pub(crate) fn load(path: &Path) -> Result<Plan> {
                 });
             }
             "MaxPool" | "AveragePool" => {
-                let s = net.shape(&node.input[0])?;
-                let out = net.shape(node.out())?;
+                let s = net.shape(&node.inputs()[0])?;
+                let out = net.shape(node.output()?)?;
                 let c = storage(s[1]);
                 ops.push(Op {
                     kind: "pool",
-                    variant: if node.op_type == "MaxPool" {
+                    variant: if node.op_type() == "MaxPool" {
                         "max"
                     } else {
                         "mean"
                     },
-                    name: node.name.clone(),
-                    src: node.input[0].clone(),
-                    dst: node.out().into(),
+                    name: node.name().to_owned(),
+                    src: node.inputs()[0].clone(),
+                    dst: node.output()?.into(),
                     h: s[2],
                     w: s[3],
                     ho: out[2],
@@ -207,7 +202,7 @@ pub(crate) fn load(path: &Path) -> Result<Plan> {
                 });
             }
             "Relu" | "Add" => {
-                ensure!(fused.contains(node.out()), "unfused {}", node.op_type);
+                ensure!(fused.contains(node.output()?), "unfused {}", node.op_type());
             }
             "Mul" | "Sigmoid" | "Transpose" | "Reshape" | "Resize" | "Shape" | "Gather"
             | "Unsqueeze" | "Slice" | "Concat" => {}
@@ -216,12 +211,12 @@ pub(crate) fn load(path: &Path) -> Result<Plan> {
     }
     // Resize can precede the convolution that absorbs it, so check coverage
     // after all fusions have been identified. Shape operators are CPU-folded.
-    for node in &net.graph.node {
+    for node in net.nodes() {
         if matches!(
-            node.op_type.as_str(),
+            node.op_type(),
             "Mul" | "Sigmoid" | "Transpose" | "Reshape" | "Resize"
         ) {
-            ensure!(fused.contains(node.out()), "unfused {}", node.op_type);
+            ensure!(fused.contains(node.output()?), "unfused {}", node.op_type());
         }
     }
     let mut ordered_heads: Vec<_> = heads.into_iter().collect();
@@ -248,23 +243,23 @@ pub(crate) fn load(path: &Path) -> Result<Plan> {
         let mut w = vec![];
         let mut b = vec![];
         for co in [2, 8, 20] {
-            let n = &net.graph.node[g[&co]];
+            let n = &net.nodes()[g[&co]];
             ensure!(
-                net.tensor(&n.input[1])?.shape()? == [co, ci, 3, 3]
-                    && n.ints("strides", &[1, 1]) == [1, 1],
+                net.tensor(&n.inputs()[1])?.shape()? == [co, ci, 3, 3]
+                    && n.integers("strides", &[1, 1]) == [1, 1],
                 "invalid head convolution"
             );
             let scale = head_scales[&g[&co]];
             // The old export multiplies float32 before conversion to half.
             w.extend(
-                net.tensor(&n.input[1])?
-                    .floats()?
+                net.tensor(&n.inputs()[1])?
+                    .f64s()?
                     .into_iter()
                     .map(|v| ((v as f32) * (scale as f32)) as f64),
             );
             b.extend(
-                net.tensor(&n.input[2])?
-                    .floats()?
+                net.tensor(&n.inputs()[2])?
+                    .f64s()?
                     .into_iter()
                     .map(|v| ((v as f32) * (scale as f32)) as f64),
             );
@@ -309,25 +304,25 @@ fn validate_head(
         20 => &["Transpose", "Reshape"],
         _ => anyhow::bail!("unsupported head channels"),
     };
-    let mut output = head.out();
+    let mut output = head.output()?;
     let mut scale = 1.;
     for expected in pipeline {
         let mut consumers = net.consumers(output);
         let node = consumers.next().context("incomplete SCRFD head pipeline")?;
         ensure!(
-            consumers.next().is_none() && node.op_type == *expected && node.input[0] == output,
+            consumers.next().is_none() && node.op_type() == *expected && node.inputs()[0] == output,
             "unsupported SCRFD head pipeline: expected only {expected} after {output}"
         );
-        if node.op_type == "Reshape" {
+        if node.op_type() == "Reshape" {
             ensure!(
-                net.tensor(&node.input[1])?.integers()? == [-1, (channels / 2) as i64],
+                net.tensor(&node.inputs()[1])?.i64s()? == [-1, (channels / 2) as i64],
                 "incorrect SCRFD head reshape"
             );
-        } else if node.op_type == "Mul" {
-            scale = net.tensor(&node.input[1])?.floats()?[0];
+        } else if node.op_type() == "Mul" {
+            scale = net.tensor(&node.inputs()[1])?.f64s()?[0];
         }
-        fused.insert(node.out().to_string());
-        output = node.out();
+        fused.insert(node.output()?.to_string());
+        output = node.output()?;
     }
     ensure!(
         net.consumers(output).next().is_none(),

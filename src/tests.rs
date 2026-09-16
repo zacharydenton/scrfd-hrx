@@ -2,8 +2,8 @@ use super::*;
 #[test]
 #[ignore = "requires gfx1151"]
 fn rgb_conversion_and_padding() -> Result<()> {
-    use hrx::loom::{
-        Specialization,
+    use hrx::{
+        loom::Specialization,
         model::{Command, Dispatch, ModelSession},
     };
 
@@ -11,8 +11,7 @@ fn rgb_conversion_and_padding() -> Result<()> {
     let input = engine.allocate_shared(32 * 3)?;
     let output = engine.allocate_shared(32 * 8 * 2)?;
     let mut spec = Specialization::new("scrfd_hwc_u8_to_nhwc_f16");
-    spec.config
-        .insert("scrfd.hwc_u8_to_nhwc_f16.size".into(), "16".into());
+    spec.set_config("scrfd.hwc_u8_to_nhwc_f16.size", "16");
     let kernels =
         unsafe { engine.compile(&[(include_str!("../kernels/hwc_u8_to_nhwc_f16.loom"), spec)])? };
     unsafe {

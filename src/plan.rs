@@ -1,4 +1,5 @@
 use anyhow::{Context, Result, ensure};
+use hrx::model::ScratchPlanner;
 use std::collections::{HashMap, HashSet};
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Op {
@@ -116,46 +117,40 @@ pub(crate) fn finish(
     for o in outputs {
         last.insert(o.clone(), ops.len());
     }
-    let mut owner = HashMap::new();
-    let mut buffers = vec![];
-    let mut free = vec![];
-    for (i, l) in ops.iter_mut().enumerate() {
-        let pick = free
-            .iter()
+    let mut planner = ScratchPlanner::new();
+    for (i, op) in ops.iter().enumerate() {
+        planner.insert(
+            op.dst.clone(),
+            op.bytes,
+            i,
+            last.get(&op.dst).copied().context("unused model value")?,
+        )?;
+    }
+    let allocation = planner.finish();
+    for l in &mut ops {
+        l.src_buf = allocation
+            .assignments()
+            .get(&l.src)
             .copied()
-            .filter(|b: &usize| buffers[*b] >= l.bytes)
-            .min_by_key(|b| buffers[*b]);
-        let b = if let Some(b) = pick {
-            free.retain(|x| *x != b);
-            b
-        } else {
-            buffers.push(l.bytes);
-            buffers.len() - 1
-        };
-        l.src_buf = owner.get(&l.src).copied().unwrap_or(usize::MAX);
-        l.extra_buf = owner.get(&l.extra).copied().unwrap_or(usize::MAX);
-        l.dst_buf = b;
+            .unwrap_or(usize::MAX);
+        l.extra_buf = allocation
+            .assignments()
+            .get(&l.extra)
+            .copied()
+            .unwrap_or(usize::MAX);
+        l.dst_buf = allocation.slot(&l.dst)?;
         ensure!(
-            b != l.src_buf && b != l.extra_buf,
+            l.dst_buf != l.src_buf && l.dst_buf != l.extra_buf,
             "in-place activation hazard"
         );
-        owner.insert(l.dst.clone(), b);
-        for t in [&l.src, &l.extra] {
-            if last.get(t) == Some(&i)
-                && let Some(b) = owner.get(t)
-                && !free.contains(b)
-            {
-                free.push(*b);
-            }
-        }
     }
     let outputs = outputs
         .iter()
-        .map(|o| owner.get(o).copied().context("missing model output"))
+        .map(|o| allocation.slot(o).map_err(anyhow::Error::from))
         .collect::<Result<_>>()?;
     Ok(Plan {
         ops,
-        buffers,
+        buffers: allocation.slots().to_vec(),
         weights,
         outputs,
     })
