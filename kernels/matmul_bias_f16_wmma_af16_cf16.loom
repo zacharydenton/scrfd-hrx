@@ -19,6 +19,7 @@ amdgpu.target<gfx11-generic> @dinov3_matmul_wmma_af16_cf16_gfx11 {subgroup_size 
 config.decl @dinov3.matmul_bias_f16_wmma_af16_cf16.k_size : %value: index where [range(%value, 32, 8192), mul(%value, 32)]
 
 config.decl @dinov3.matmul_bias_f16_wmma_af16_cf16.n_size : %value: index where [range(%value, 64, 8192), mul(%value, 64)]
+config.decl @dinov3.matmul_bias_f16_wmma_af16_cf16.n_stride : %value: index where [range(%value, 32, 8192), mul(%value, 32)]
 
 kernel.def target(@dinov3_matmul_wmma_af16_cf16_gfx11) export("dinov3_matmul_bias_f16_wmma_af16_cf16") @dinov3_matmul_bias_f16_wmma_af16_cf16(%m_size: index) {
   %c1 = index.constant 1 : index
@@ -35,6 +36,8 @@ kernel.def target(@dinov3_matmul_wmma_af16_cf16_gfx11) export("dinov3_matmul_bia
   %n_size0 = config.get @dinov3.matmul_bias_f16_wmma_af16_cf16.n_size : index
   %k_size = index.assume %k_size0 [range(%k_size0, 32, 8192), mul(%k_size0, 32)] : index
   %n_size = index.assume %n_size0 [range(%n_size0, 64, 8192), mul(%n_size0, 64)] : index
+  %n_stride0 = config.get @dinov3.matmul_bias_f16_wmma_af16_cf16.n_stride : index
+  %n_stride = index.assume %n_stride0 [range(%n_stride0, 32, 8192), mul(%n_stride0, 32)] : index
 
   %c0 = index.constant 0 : index
   %c1 = index.constant 1 : index
@@ -79,7 +82,7 @@ kernel.def target(@dinov3_matmul_wmma_af16_cf16_gfx11) export("dinov3_matmul_bia
   %a_view = buffer.view %a_global[%c0_offset] : buffer -> view<[%m_size]x[%k_size]xf16>
   %w_view = buffer.view %w_global[%c0_offset] : buffer -> view<[%n_size]x[%k_size]xf16>
   %bias_view = buffer.view %bias_global[%c0_offset] : buffer -> view<[%n_size]xf32>
-  %c_view = buffer.view %c_global[%c0_offset] : buffer -> view<[%m_size]x[%n_size]xf16>
+  %c_view = buffer.view %c_global[%c0_offset] : buffer -> view<[%m_size]x[%n_stride]xf16>
 
   %a_stage = buffer.alloca<workgroup> align(16) %a_stage_bytes : buffer
   %w_stage = buffer.alloca<workgroup> align(16) %w_stage_bytes : buffer
@@ -160,11 +163,15 @@ kernel.def target(@dinov3_matmul_wmma_af16_cf16_gfx11) export("dinov3_matmul_bia
       %biased = vector.addf %values, %bias_values : vector<4xf32>
       %row_local = index.add %wave_row, %publish_row : index
       %out_row = index.add %base_m, %row_local : index
-      %writes = index.cmp ult, %out_row, %m_size : index
+      %row_writes = index.cmp ult, %out_row, %m_size : index
+      %out_limit = index.sub %n_stride, %c4 : index
+      %channel_writes = index.cmp ule, %out_col, %out_limit : index
+      %writes = scalar.andi %row_writes, %channel_writes : i1
       scf.if %writes {
+        %safe_out_col = index.assume %out_col [le(%out_col, %out_limit), mul(%out_col, 4)] : index
         %bounded = index.assume %out_row [lt(%out_row, %m_size)] : index
         %narrow = vector.fptrunc %biased : vector<4xf32> to vector<4xf16>
-        vector.store %narrow, %c_view[%bounded, %out_col] : vector<4xf16>, view<[%m_size]x[%n_size]xf16>
+        vector.store %narrow, %c_view[%bounded, %safe_out_col] : vector<4xf16>, view<[%m_size]x[%n_stride]xf16>
       }
     }
     kernel.barrier<workgroup> scope(subgroup) ordering(acq_rel)

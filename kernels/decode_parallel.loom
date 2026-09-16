@@ -1,0 +1,264 @@
+// Stable parallel SCRFD compaction. Anchor order is level, pixel, anchor.
+amdgpu.target<gfx11-generic> @target {subgroup_size = 32}
+kernel.def target(@target) export("decode_parallel") @decode_parallel(%unused:index) {
+ %one=index.constant 1 : index
+ %threads=index.constant 256 : index
+ %gx=index.constant 66 : index
+ %gy=index.constant @BATCH@ : index
+ kernel.launch.config workgroups(%gx,%gy,%one) workgroup_size(%threads,%one,%one) : index
+} launch(%unused:index,%h0:buffer,%h1:buffer,%h2:buffer,%meta:buffer,%lut:buffer,%ranks:buffer,%offsets:buffer,%candidates:buffer,%summary:buffer,%status:buffer) {
+ %off=index.constant 0 : offset
+ %zero=index.constant 0 : index
+ %one=index.constant 1 : index
+ %two=index.constant 2 : index
+ %threads=index.constant 256 : index
+ %lane=kernel.workitem.id<x> : index
+ %group_raw=kernel.workgroup.id<x> : index
+ %group=index.assume %group_raw [range(%group_raw,0,65)] : index
+ %br=kernel.workgroup.id<y> : index
+ %b=index.assume %br [range(%br,0,@LAST_BATCH@)] : index
+ %i0=scalar.constant 0 : i32
+ %i1=scalar.constant 1 : i32
+ %i4=scalar.constant 4 : i32
+ %base=index.mul %group,%threads : index
+ %raw=index.add %base,%lane : index
+ %anchor=index.assume %raw [range(%raw,0,16895)] : index
+ %g=index.assume %group [range(%group,0,65)] : index
+ %rv=buffer.view %ranks[%off] : buffer -> view<@BATCH@x16896xi32>
+ %ov=buffer.view %offsets[%off] : buffer -> view<@BATCH@x66xi32>
+ %rank=view.load %rv[%b,%anchor] : view<@BATCH@x16896xi32> -> i32
+ %offset=view.load %ov[%b,%g] : view<@BATCH@x66xi32> -> i32
+ %position=scalar.addi %rank,%offset : i32
+ %eligible=scalar.cmpi sge,%rank,%i0 : i32
+ %cap=scalar.constant @CAP@ : i32
+ %room=scalar.cmpi ult,%position,%cap : i32
+ %active=scalar.andi %eligible,%room : i1
+ scf.if %active {
+  %rank_index0=index.cast %rank : i32 to index
+  %rank_index=index.assume %rank_index0 [range(%rank_index0,0,255)] : index
+  %offset_index0=index.cast %offset : i32 to index
+  %offset_index=index.assume %offset_index0 [range(%offset_index0,0,16800)] : index
+  %row0=index.add %rank_index,%offset_index : index
+  %row=index.assume %row0 [range(%row0,0,@LAST_CAP@)] : index
+  %cv=buffer.view %candidates[%off] : buffer -> view<@BATCH@x@CAP@x16xf32>
+  %sv=buffer.view %summary[%off] : buffer -> view<@BATCH@x@CAP@x5xf32>
+  %mv=buffer.view %meta[%off] : buffer -> view<@BATCH@x3xf32>
+  %lv=buffer.view %lut[%off] : buffer -> view<65536xf32>
+  %scale=view.load %mv[%b,%zero] : view<@BATCH@x3xf32> -> f32
+  %end0=index.constant 12800 : index
+  %end1=index.constant 16000 : index
+  %in0=index.cmp ult,%anchor,%end0 : index
+  %in1=index.cmp ult,%anchor,%end1 : index
+  %errors=scf.if %in0 -> (i32) {
+   %start0=index.constant 0 : index
+   %localraw0=index.sub %anchor,%start0 : index
+   %local0=index.assume %localraw0 [range(%localraw0,0,12799)] : index
+   %pixel00=index.div %local0,%two : index
+   %pixel0=index.assume %pixel00 [range(%pixel00,0,6399)] : index
+   %a0=index.rem %local0,%two : index
+   %hv0=buffer.view %h0[%off] : buffer -> view<@BATCH@x6400x64xf16>
+   %logit0=view.load %hv0[%b,%pixel0,%a0] : view<@BATCH@x6400x64xf16> -> f16
+   %bits160=scalar.bitcast %logit0 : f16 to i16
+   %bits0=scalar.extui %bits160 : i16 to i32
+   %li00=index.cast %bits0 : i32 to index
+   %li0=index.assume %li00 [range(%li00,0,65535)] : index
+   %score0=view.load %lv[%li0] : view<65536xf32> -> f32
+   view.store %score0,%cv[%b,%row,%zero] : f32,view<@BATCH@x@CAP@x16xf32>
+   view.store %score0,%sv[%b,%row,%zero] : f32,view<@BATCH@x@CAP@x5xf32>
+   %size0=index.constant 80 : index
+   %stride0=scalar.constant 8.0 : f32
+   %x0=index.rem %pixel0,%size0 : index
+   %y0=index.div %pixel0,%size0 : index
+   %xi0=index.cast %x0 : index to i32
+   %yi0=index.cast %y0 : index to i32
+   %xf0=scalar.uitofp %xi0 : i32 to f32
+   %yf0=scalar.uitofp %yi0 : i32 to f32
+   %cx0=scalar.mulf %xf0,%stride0 : f32
+   %cy0=scalar.mulf %yf0,%stride0 : f32
+   %four0=index.constant 4 : index
+   %six0=index.constant 6 : index
+   %ten0=index.constant 10 : index
+   %fourteen0=index.constant 14 : index
+   %exp0=scalar.constant 2139095040 : i32
+   %i20=scalar.constant 2 : i32
+   %errs0=scf.for %coord0=[%zero to %fourteen0 step %one](%err0=%i0 : i32) -> (i32) {
+    %box0=index.cmp ult,%coord0,%four0 : index
+    %distance0=index.cmp ult,%coord0,%two : index
+    %step0=scf.select %box0,%four0,%ten0 : index
+    %coff0=scf.select %box0,%two,%six0 : index
+    %cb0=index.mul %a0,%step0 : index
+    %c00=index.add %cb0,%coff0 : index
+    %cr0=index.add %c00,%coord0 : index
+    %ch0=index.assume %cr0 [range(%cr0,0,29)] : index
+    %half0=view.load %hv0[%b,%pixel0,%ch0] : view<@BATCH@x6400x64xf16> -> f16
+    %v0=scalar.extf %half0 : f16 to f32
+    %delta0=scalar.mulf %v0,%stride0 : f32
+    %axis0=index.rem %coord0,%two : index
+    %isx0=index.cmp eq,%axis0,%zero : index
+    %center0=scf.select %isx0,%cx0,%cy0 : f32
+    %pos0=scalar.addf %center0,%delta0 : f32
+    %neg0=scalar.subf %center0,%delta0 : f32
+    %point0=scf.select %distance0,%neg0,%pos0 : f32
+    %result0=scalar.divf %point0,%scale : f32
+    %out00=index.add %coord0,%one : index
+    %out0=index.assume %out00 [range(%out00,1,14)] : index
+    view.store %result0,%cv[%b,%row,%out0] : f32,view<@BATCH@x@CAP@x16xf32>
+    scf.if %box0 {
+     %out50=index.assume %out0 [range(%out0,1,4)] : index
+     view.store %result0,%sv[%b,%row,%out50] : f32,view<@BATCH@x@CAP@x5xf32>
+    }
+    %vbits0=scalar.bitcast %result0 : f32 to i32
+    %vexp0=scalar.andi %vbits0,%exp0 : i32
+    %finite0=scalar.cmpi ne,%vexp0,%exp0 : i32
+    %flag0=scf.select %finite0,%i0,%i20 : i32
+    %next0=scalar.ori %err0,%flag0 : i32
+    scf.yield %next0 : i32
+   }
+   scf.yield %errs0 : i32
+  } else {
+   %err12=scf.if %in1 -> (i32) {
+   %start1=index.constant 12800 : index
+   %localraw1=index.sub %anchor,%start1 : index
+   %local1=index.assume %localraw1 [range(%localraw1,0,3199)] : index
+   %pixel01=index.div %local1,%two : index
+   %pixel1=index.assume %pixel01 [range(%pixel01,0,1599)] : index
+   %a1=index.rem %local1,%two : index
+   %hv1=buffer.view %h1[%off] : buffer -> view<@BATCH@x1600x64xf16>
+   %logit1=view.load %hv1[%b,%pixel1,%a1] : view<@BATCH@x1600x64xf16> -> f16
+   %bits161=scalar.bitcast %logit1 : f16 to i16
+   %bits1=scalar.extui %bits161 : i16 to i32
+   %li01=index.cast %bits1 : i32 to index
+   %li1=index.assume %li01 [range(%li01,0,65535)] : index
+   %score1=view.load %lv[%li1] : view<65536xf32> -> f32
+   view.store %score1,%cv[%b,%row,%zero] : f32,view<@BATCH@x@CAP@x16xf32>
+   view.store %score1,%sv[%b,%row,%zero] : f32,view<@BATCH@x@CAP@x5xf32>
+   %size1=index.constant 40 : index
+   %stride1=scalar.constant 16.0 : f32
+   %x1=index.rem %pixel1,%size1 : index
+   %y1=index.div %pixel1,%size1 : index
+   %xi1=index.cast %x1 : index to i32
+   %yi1=index.cast %y1 : index to i32
+   %xf1=scalar.uitofp %xi1 : i32 to f32
+   %yf1=scalar.uitofp %yi1 : i32 to f32
+   %cx1=scalar.mulf %xf1,%stride1 : f32
+   %cy1=scalar.mulf %yf1,%stride1 : f32
+   %four1=index.constant 4 : index
+   %six1=index.constant 6 : index
+   %ten1=index.constant 10 : index
+   %fourteen1=index.constant 14 : index
+   %exp1=scalar.constant 2139095040 : i32
+   %i21=scalar.constant 2 : i32
+   %errs1=scf.for %coord1=[%zero to %fourteen1 step %one](%err1=%i0 : i32) -> (i32) {
+    %box1=index.cmp ult,%coord1,%four1 : index
+    %distance1=index.cmp ult,%coord1,%two : index
+    %step1=scf.select %box1,%four1,%ten1 : index
+    %coff1=scf.select %box1,%two,%six1 : index
+    %cb1=index.mul %a1,%step1 : index
+    %c01=index.add %cb1,%coff1 : index
+    %cr1=index.add %c01,%coord1 : index
+    %ch1=index.assume %cr1 [range(%cr1,0,29)] : index
+    %half1=view.load %hv1[%b,%pixel1,%ch1] : view<@BATCH@x1600x64xf16> -> f16
+    %v1=scalar.extf %half1 : f16 to f32
+    %delta1=scalar.mulf %v1,%stride1 : f32
+    %axis1=index.rem %coord1,%two : index
+    %isx1=index.cmp eq,%axis1,%zero : index
+    %center1=scf.select %isx1,%cx1,%cy1 : f32
+    %pos1=scalar.addf %center1,%delta1 : f32
+    %neg1=scalar.subf %center1,%delta1 : f32
+    %point1=scf.select %distance1,%neg1,%pos1 : f32
+    %result1=scalar.divf %point1,%scale : f32
+    %out01=index.add %coord1,%one : index
+    %out1=index.assume %out01 [range(%out01,1,14)] : index
+    view.store %result1,%cv[%b,%row,%out1] : f32,view<@BATCH@x@CAP@x16xf32>
+    scf.if %box1 {
+     %out51=index.assume %out1 [range(%out1,1,4)] : index
+     view.store %result1,%sv[%b,%row,%out51] : f32,view<@BATCH@x@CAP@x5xf32>
+    }
+    %vbits1=scalar.bitcast %result1 : f32 to i32
+    %vexp1=scalar.andi %vbits1,%exp1 : i32
+    %finite1=scalar.cmpi ne,%vexp1,%exp1 : i32
+    %flag1=scf.select %finite1,%i0,%i21 : i32
+    %next1=scalar.ori %err1,%flag1 : i32
+    scf.yield %next1 : i32
+   }
+   scf.yield %errs1 : i32
+   } else {
+   %start2=index.constant 16000 : index
+   %localraw2=index.sub %anchor,%start2 : index
+   %local2=index.assume %localraw2 [range(%localraw2,0,799)] : index
+   %pixel02=index.div %local2,%two : index
+   %pixel2=index.assume %pixel02 [range(%pixel02,0,399)] : index
+   %a2=index.rem %local2,%two : index
+   %hv2=buffer.view %h2[%off] : buffer -> view<@BATCH@x400x64xf16>
+   %logit2=view.load %hv2[%b,%pixel2,%a2] : view<@BATCH@x400x64xf16> -> f16
+   %bits162=scalar.bitcast %logit2 : f16 to i16
+   %bits2=scalar.extui %bits162 : i16 to i32
+   %li02=index.cast %bits2 : i32 to index
+   %li2=index.assume %li02 [range(%li02,0,65535)] : index
+   %score2=view.load %lv[%li2] : view<65536xf32> -> f32
+   view.store %score2,%cv[%b,%row,%zero] : f32,view<@BATCH@x@CAP@x16xf32>
+   view.store %score2,%sv[%b,%row,%zero] : f32,view<@BATCH@x@CAP@x5xf32>
+   %size2=index.constant 20 : index
+   %stride2=scalar.constant 32.0 : f32
+   %x2=index.rem %pixel2,%size2 : index
+   %y2=index.div %pixel2,%size2 : index
+   %xi2=index.cast %x2 : index to i32
+   %yi2=index.cast %y2 : index to i32
+   %xf2=scalar.uitofp %xi2 : i32 to f32
+   %yf2=scalar.uitofp %yi2 : i32 to f32
+   %cx2=scalar.mulf %xf2,%stride2 : f32
+   %cy2=scalar.mulf %yf2,%stride2 : f32
+   %four2=index.constant 4 : index
+   %six2=index.constant 6 : index
+   %ten2=index.constant 10 : index
+   %fourteen2=index.constant 14 : index
+   %exp2=scalar.constant 2139095040 : i32
+   %i22=scalar.constant 2 : i32
+   %errs2=scf.for %coord2=[%zero to %fourteen2 step %one](%err2=%i0 : i32) -> (i32) {
+    %box2=index.cmp ult,%coord2,%four2 : index
+    %distance2=index.cmp ult,%coord2,%two : index
+    %step2=scf.select %box2,%four2,%ten2 : index
+    %coff2=scf.select %box2,%two,%six2 : index
+    %cb2=index.mul %a2,%step2 : index
+    %c02=index.add %cb2,%coff2 : index
+    %cr2=index.add %c02,%coord2 : index
+    %ch2=index.assume %cr2 [range(%cr2,0,29)] : index
+    %half2=view.load %hv2[%b,%pixel2,%ch2] : view<@BATCH@x400x64xf16> -> f16
+    %v2=scalar.extf %half2 : f16 to f32
+    %delta2=scalar.mulf %v2,%stride2 : f32
+    %axis2=index.rem %coord2,%two : index
+    %isx2=index.cmp eq,%axis2,%zero : index
+    %center2=scf.select %isx2,%cx2,%cy2 : f32
+    %pos2=scalar.addf %center2,%delta2 : f32
+    %neg2=scalar.subf %center2,%delta2 : f32
+    %point2=scf.select %distance2,%neg2,%pos2 : f32
+    %result2=scalar.divf %point2,%scale : f32
+    %out02=index.add %coord2,%one : index
+    %out2=index.assume %out02 [range(%out02,1,14)] : index
+    view.store %result2,%cv[%b,%row,%out2] : f32,view<@BATCH@x@CAP@x16xf32>
+    scf.if %box2 {
+     %out52=index.assume %out2 [range(%out2,1,4)] : index
+     view.store %result2,%sv[%b,%row,%out52] : f32,view<@BATCH@x@CAP@x5xf32>
+    }
+    %vbits2=scalar.bitcast %result2 : f32 to i32
+    %vexp2=scalar.andi %vbits2,%exp2 : i32
+    %finite2=scalar.cmpi ne,%vexp2,%exp2 : i32
+    %flag2=scf.select %finite2,%i0,%i22 : i32
+    %next2=scalar.ori %err2,%flag2 : i32
+    scf.yield %next2 : i32
+   }
+   scf.yield %errs2 : i32
+   }
+   scf.yield %err12 : i32
+  }
+  %last=index.constant 15 : index
+  %z=scalar.constant 0.0 : f32
+  view.store %z,%cv[%b,%row,%last] : f32,view<@BATCH@x@CAP@x16xf32>
+  %bad=scalar.cmpi ne,%errors,%i0 : i32
+  scf.if %bad {
+   %statusv=buffer.view %status[%off] : buffer -> view<@BATCH@x2xi32>
+   view.atomic.reduce<ori> %errors,%statusv[%b,%zero] {ordering = relaxed, scope = device} : i32,view<@BATCH@x2xi32>
+  }
+ }
+ kernel.return
+}

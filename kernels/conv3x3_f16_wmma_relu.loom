@@ -8,8 +8,9 @@
 //     with k = (dy*3 + dx)*Cin_pad + c, reading in[(b*H + yi)*W + xi, c] for
 //     yi = yo*stride + dy - 1, xi = xo*stride + dx - 1, zero outside the image.
 //
-// A is NHWC f16 [B*H*W][Cin_stride]; W is [Cout_pad][K_pad] f16 in that k order
-// (the model importer); C is NHWC f16 [B*Ho*Wo][n_size]. f32 accumulate.
+// A is NHWC f16 [B*H*W][cin_stride]; W is [n_size][k_size] f16.
+// C is NHWC f16 [B*Ho*Wo][n_stride], independently packed from WMMA N.
+// Accumulation is f32; stores skip channels outside the physical output row.
 // Cin_pad and Cin_stride are multiples of 8: each lane gathers one row x
 // vector<8xf16> per k-step, so a packet never straddles a tap.
 //
@@ -29,13 +30,14 @@ config.decl @scrfd.conv3x3_f16_wmma_relu.cin_pad : %value: index where [range(%v
 // Physical channel stride of the input rows: the width its producer wrote,
 // which is that conv's Cout_pad (64-aligned), or 4 for the stem's converted
 // image. The gather reads only c < cin_pad inside each row, so the MMA work is
-// 9*cin_pad, not 9*cin_stride -- for an 88-channel tensor stored 128 wide that
-// is the difference between K=800 and K=1152.
+// 9*cin_pad, not 9*cin_stride -- for an 88-channel tensor stored 96 wide that
+// is the difference between K=800 and K=864.
 config.decl @scrfd.conv3x3_f16_wmma_relu.cin_stride : %value: index where [range(%value, 8, 1024), mul(%value, 8)]
 
 config.decl @scrfd.conv3x3_f16_wmma_relu.k_size : %value: index where [range(%value, 32, 16384), mul(%value, 32)]
 
 config.decl @scrfd.conv3x3_f16_wmma_relu.n_size : %value: index where [range(%value, 64, 8192), mul(%value, 64)]
+config.decl @scrfd.conv3x3_f16_wmma_relu.n_stride : %value: index where [range(%value, 32, 8192), mul(%value, 32)]
 
 kernel.def target(@scrfd_conv3x3_f16_wmma_relu_gfx11) export("scrfd_conv3x3_f16_wmma_relu") @scrfd_conv3x3_f16_wmma_relu(%m_size: index) {
   %c1 = index.constant 1 : index
@@ -52,6 +54,8 @@ kernel.def target(@scrfd_conv3x3_f16_wmma_relu_gfx11) export("scrfd_conv3x3_f16_
   %n_size0 = config.get @scrfd.conv3x3_f16_wmma_relu.n_size : index
   %k_size = index.assume %k_size0 [range(%k_size0, 32, 16384), mul(%k_size0, 32)] : index
   %n_size = index.assume %n_size0 [range(%n_size0, 64, 8192), mul(%n_size0, 64)] : index
+  %n_stride0 = config.get @scrfd.conv3x3_f16_wmma_relu.n_stride : index
+  %n_stride = index.assume %n_stride0 [range(%n_stride0, 32, 8192), mul(%n_stride0, 32)] : index
   %height = config.get @scrfd.conv3x3_f16_wmma_relu.height : index
   %width = config.get @scrfd.conv3x3_f16_wmma_relu.width : index
   %stride = config.get @scrfd.conv3x3_f16_wmma_relu.stride : index
@@ -116,7 +120,7 @@ kernel.def target(@scrfd_conv3x3_f16_wmma_relu_gfx11) export("scrfd_conv3x3_f16_
   %a_view = buffer.view %a_global[%c0_offset] : buffer -> view<[%in_rows_total]x[%cin_stride]xf16>
   %w_view = buffer.view %w_global[%c0_offset] : buffer -> view<[%n_size]x[%k_size]xf16>
   %bias_view = buffer.view %bias_global[%c0_offset] : buffer -> view<[%n_size]xf32>
-  %c_view = buffer.view %c_global[%c0_offset] : buffer -> view<[%m_size]x[%n_size]xf16>
+  %c_view = buffer.view %c_global[%c0_offset] : buffer -> view<[%m_size]x[%n_stride]xf16>
 
   %a_stage = buffer.alloca<workgroup> align(16) %a_stage_bytes : buffer
   %w_stage = buffer.alloca<workgroup> align(16) %w_stage_bytes : buffer
@@ -312,12 +316,16 @@ kernel.def target(@scrfd_conv3x3_f16_wmma_relu_gfx11) export("scrfd_conv3x3_f16_
       %biased = vector.addf %values, %bias_values : vector<4xf32>
       %row_local = index.add %wave_row, %publish_row : index
       %out_row = index.add %base_m, %row_local : index
-      %writes = index.cmp ult, %out_row, %m_size : index
+      %row_writes = index.cmp ult, %out_row, %m_size : index
+      %out_limit = index.sub %n_stride, %c4 : index
+      %channel_writes = index.cmp ule, %out_col, %out_limit : index
+      %writes = scalar.andi %row_writes, %channel_writes : i1
       scf.if %writes {
+        %safe_out_col = index.assume %out_col [le(%out_col, %out_limit), mul(%out_col, 4)] : index
         %bounded = index.assume %out_row [lt(%out_row, %m_size)] : index
         %activated = vector.maxnumf %biased, %zero_f32x4 : vector<4xf32>
         %narrow = vector.fptrunc %activated : vector<4xf32> to vector<4xf16>
-        vector.store %narrow, %c_view[%bounded, %out_col] : vector<4xf16>, view<[%m_size]x[%n_size]xf16>
+        vector.store %narrow, %c_view[%bounded, %safe_out_col] : vector<4xf16>, view<[%m_size]x[%n_stride]xf16>
       }
     }
     kernel.barrier<workgroup> scope(subgroup) ordering(acq_rel)

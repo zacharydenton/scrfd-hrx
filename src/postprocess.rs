@@ -2,9 +2,9 @@
 use crate::{Detection, DetectionOptions, detection::select_candidates};
 use anyhow::{Result, ensure};
 use hrx::{
-    inference::{ModelContext, PreparedModel},
+    inference::{Inference, ModelContext, PreparedModel},
     loom::Specialization,
-    model::{Command, Dispatch, ModelSession},
+    model::{Command, Dispatch, ModelFragment, ModelSession},
     plan_cache::PlanCache,
     tensor::{DType, DeviceTensor, Layout, TensorDesc, TensorOps},
 };
@@ -26,83 +26,116 @@ impl Postprocess {
     }
     fn prepare(&self, batch: usize, options: DetectionOptions) -> Result<Arc<PreparedModel>> {
         options.validate()?;
-        ensure!((1..=64).contains(&batch), "invalid postprocess batch");
         let capacity = options.max_candidates.min(16800);
         Ok(self
             .plans
             .get_or_prepare((batch, options.threshold.to_bits(), capacity), || {
-                let mut session = ModelSession::in_context(&self.context)?;
-                let mut inputs = Vec::new();
-                for size in [80, 40, 20] {
-                    let desc = TensorDesc::new(DType::F16, vec![batch, size, size, 64])?
-                        .with_layout(Layout::Nhwc)?;
-                    inputs.push((session.allocate(desc.bytes())?, desc));
-                }
-                let meta = TensorDesc::new(DType::F32, vec![batch, 3])?;
-                inputs.push((session.allocate(meta.bytes())?, meta));
-                let rows = TensorDesc::new(DType::F32, vec![batch * capacity, 16])?;
-                let status = TensorDesc::new(DType::I32, vec![batch, 2])?;
-                let compact = TensorDesc::new(DType::F32, vec![batch, capacity, 5])?;
-                let candidate = session.allocate(rows.bytes())?;
-                let flags = session.allocate(status.bytes())?;
-                let summary = session.allocate(compact.bytes())?;
-                let sigmoid: Vec<f32> = (0..=u16::MAX)
-                    .map(|bits| 1. / (1. + (-half::f16::from_bits(bits).to_f32()).exp()))
-                    .collect();
-                let lut = session.weight(bytemuck::cast_slice(&sigmoid))?;
-                let specialize = |source: &str| {
-                    let mut source = source.to_owned();
-                    for (key, value) in [
-                        ("BATCH", batch.to_string()),
-                        ("LAST_BATCH", (batch - 1).to_string()),
-                        ("CAP", capacity.to_string()),
-                        ("LAST_CAP", (capacity - 1).to_string()),
-                        ("THRESHOLD", format!("{:.9e}", options.threshold)),
-                        ("COUNT", compact.elements().to_string()),
-                        ("LAST", (compact.elements() - 1).to_string()),
-                        ("GRID", compact.elements().div_ceil(256).to_string()),
-                    ] {
-                        source = source.replace(&format!("@{key}@"), &value);
-                    }
-                    source
-                };
-                let decode = specialize(include_str!("../kernels/decode.loom"));
-                let compact_code = specialize(include_str!("../kernels/compact.loom"));
-                let kernels = unsafe {
-                    session.compile(&[
-                        (&decode, Specialization::new("decode")),
-                        (&compact_code, Specialization::new("compact")),
-                    ])?
-                };
-                let mut args: Vec<_> = inputs.iter().map(|(r, _)| r.read()).collect();
-                args.extend([lut.read(), candidate.write(), flags.write()]);
-                let commands = [
-                    Command::Fill {
-                        region: candidate,
-                        value: 0,
-                    },
-                    Command::Dispatch(Dispatch::indices(
-                        kernels[0],
-                        [0],
-                        [batch as u32, 1, 1],
-                        args,
-                    )),
-                    Command::Dispatch(Dispatch::indices(
-                        kernels[1],
-                        [0],
-                        [compact.elements().div_ceil(256) as u32, 1, 1],
-                        vec![candidate.read(), summary.write()],
-                    )),
-                ];
-                unsafe {
-                    session.freeze(&self.context)?.prepare(
-                        &commands,
-                        &inputs,
-                        &[(flags, status), (candidate, rows), (summary, compact)],
-                        3,
-                    )
-                }
+                self.fragment(batch, options)
+                    .map_err(|e| hrx::Error::Message(e.to_string()))?
+                    .prepare(3)
             })?)
+    }
+    /// Shared decoding fragment for both host and resident entry points.
+    pub(crate) fn fragment(
+        &self,
+        batch: usize,
+        options: DetectionOptions,
+    ) -> Result<ModelFragment> {
+        options.validate()?;
+        ensure!((1..=64).contains(&batch), "invalid postprocess batch");
+        let capacity = options.max_candidates.min(16800);
+        let mut session = ModelSession::in_context(&self.context)?;
+        let mut inputs = Vec::new();
+        for size in [80, 40, 20] {
+            let desc = TensorDesc::new(DType::F16, vec![batch, size, size, 64])?
+                .with_layout(Layout::Nhwc)?;
+            inputs.push((session.allocate(desc.bytes())?, desc));
+        }
+        let meta = TensorDesc::new(DType::F32, vec![batch, 3])?;
+        inputs.push((session.allocate(meta.bytes())?, meta));
+        let rows = TensorDesc::new(DType::F32, vec![batch * capacity, 16])?;
+        let status = TensorDesc::new(DType::I32, vec![batch, 2])?;
+        let compact = TensorDesc::new(DType::F32, vec![batch, capacity, 5])?;
+        let candidate = session.allocate_shared(rows.bytes())?;
+        let flags = session.allocate_shared(status.bytes())?;
+        let summary = session.allocate_shared(compact.bytes())?;
+        let sigmoid: Vec<f32> = (0..=u16::MAX)
+            .map(|bits| 1. / (1. + (-half::f16::from_bits(bits).to_f32()).exp()))
+            .collect();
+        let lut = session.weight(bytemuck::cast_slice(&sigmoid))?;
+        let specialize = |source: &str| {
+            let mut source = source.to_owned();
+            for (key, value) in [
+                ("BATCH", batch.to_string()),
+                ("LAST_BATCH", (batch - 1).to_string()),
+                ("CAP", capacity.to_string()),
+                ("LAST_CAP", (capacity - 1).to_string()),
+                ("THRESHOLD", format!("{:.9e}", options.threshold)),
+            ] {
+                source = source.replace(&format!("@{key}@"), &value);
+            }
+            source
+        };
+        // 66 blocks of 256 anchors: local ranks, block counts/error bits,
+        // and exclusive block offsets preserve the CPU anchor order.
+        let ranks = session.allocate(batch * 16896 * 4)?;
+        let groups = session.allocate(batch * 66 * 2 * 4)?;
+        let offsets = session.allocate(batch * 66 * 4)?;
+        let classify = specialize(include_str!("../kernels/classify.loom"));
+        let prefix = specialize(include_str!("../kernels/prefix_groups.loom"));
+        let decode = specialize(include_str!("../kernels/decode_parallel.loom"));
+        let kernels = unsafe {
+            session.compile(&[
+                (&classify, Specialization::new("classify")),
+                (&prefix, Specialization::new("prefix_groups")),
+                (&decode, Specialization::new("decode_parallel")),
+            ])?
+        };
+        let commands = [
+            Command::Dispatch(Dispatch::indices(
+                kernels[0],
+                [0],
+                [66, batch as u32, 1],
+                vec![
+                    inputs[0].0.read(),
+                    inputs[1].0.read(),
+                    inputs[2].0.read(),
+                    lut.read(),
+                    ranks.write(),
+                    groups.write(),
+                ],
+            )),
+            Command::Dispatch(Dispatch::indices(
+                kernels[1],
+                [0],
+                [1, batch as u32, 1],
+                vec![groups.read(), offsets.write(), flags.write()],
+            )),
+            Command::Dispatch(Dispatch::indices(
+                kernels[2],
+                [0],
+                [66, batch as u32, 1],
+                vec![
+                    inputs[0].0.read(),
+                    inputs[1].0.read(),
+                    inputs[2].0.read(),
+                    inputs[3].0.read(),
+                    lut.read(),
+                    ranks.read(),
+                    offsets.read(),
+                    candidate.write(),
+                    summary.write(),
+                    flags.read_write(),
+                ],
+            )),
+        ];
+        unsafe {
+            Ok(session.freeze(&self.context)?.fragment(
+                &commands,
+                &inputs,
+                &[(flags, status), (candidate, rows), (summary, compact)],
+            )?)
+        }
     }
     /// Wait for compact candidate metadata, select on CPU, then enqueue GPU
     /// gathering. This intentional host stage is not a failure fallback.
@@ -126,7 +159,6 @@ impl Postprocess {
             self.context.validate(head)?;
         }
         let plan = self.prepare(scales.len(), options)?;
-        let capacity = options.max_candidates.min(16800);
         let metadata: Vec<f32> = scales
             .iter()
             .zip(shapes)
@@ -138,8 +170,35 @@ impl Postprocess {
             bytemuck::cast_slice(&metadata),
         )?);
         let decoded = plan.submit(&inputs)?;
-        let status = self.context.download(&decoded.outputs()[0])?.wait()?;
-        let mut candidates = Vec::with_capacity(scales.len());
+        let selected = self.select(decoded, shapes, options)?;
+        let rows = self
+            .tensors
+            .gather_rows(&selected.rows, &selected.indices)?;
+        Ok(Detections {
+            context: self.context.clone(),
+            rows,
+            offsets: selected.offsets,
+            candidates: selected.candidates,
+        })
+    }
+    fn select(
+        &self,
+        decoded: Inference,
+        shapes: &[[usize; 2]],
+        options: DetectionOptions,
+    ) -> Result<Selected> {
+        options.validate()?;
+        let capacity = options.max_candidates.min(16800);
+        // Keep the inference lease until selection and any host row reads finish.
+        // These terminal buffers are coherent; no dense readback/copy is needed.
+        let outputs = decoded.wait()?;
+        let status_binding = outputs[0].binding().unwrap();
+        let status = status_binding.map_read()?;
+        ensure!(
+            status.len() == shapes.len() * 8,
+            "invalid detector status shape"
+        );
+        let mut candidates = Vec::with_capacity(shapes.len());
         for pair in status.as_chunks::<8>().0 {
             let error = i32::from_le_bytes(pair[..4].try_into().unwrap());
             let count = i32::from_le_bytes(pair[4..].try_into().unwrap());
@@ -152,50 +211,69 @@ impl Postprocess {
             );
             candidates.push(count as usize);
         }
-        let reads = candidates
-            .iter()
-            .enumerate()
-            .map(|(b, &count)| {
-                let view = decoded.outputs()[2].view(
-                    b * capacity * 20,
-                    TensorDesc::new(DType::F32, vec![count, 5])?,
-                )?;
-                self.context.download(&view)
-            })
-            .collect::<hrx::Result<Vec<_>>>()?;
-        let mut selected = Vec::new();
+        let summary_binding = outputs[2].binding().unwrap();
+        let summary = summary_binding.map_read()?;
+        let mut indices = Vec::new();
         let mut offsets = vec![0];
-        for (b, read) in reads.into_iter().enumerate() {
-            let bytes = read.wait()?;
-            let boxes: Vec<[f32; 5]> = bytes
-                .as_chunks::<20>()
-                .0
-                .iter()
-                .map(|row| {
-                    std::array::from_fn(|i| {
-                        f32::from_le_bytes(row[i * 4..][..4].try_into().unwrap())
-                    })
-                })
-                .collect();
-            selected.extend(
-                select_candidates(&boxes, shapes[b], options)
+        for (b, &count) in candidates.iter().enumerate() {
+            let boxes: &[[f32; 5]] =
+                bytemuck::try_cast_slice(&summary[b * capacity * 20..][..count * 20])
+                    .map_err(|e| anyhow::anyhow!("invalid candidate summary: {e}"))?;
+            indices.extend(
+                select_candidates(boxes, shapes[b], options)
                     .into_iter()
                     .map(|i| b * capacity + i),
             );
-            offsets.push(selected.len());
+            offsets.push(indices.len());
         }
-        let rows = self.tensors.gather_rows(&decoded.outputs()[1], &selected)?;
-        Ok(Detections {
-            context: self.context.clone(),
-            rows,
+        Ok(Selected {
+            rows: outputs[1].clone(),
+            indices,
             offsets,
             candidates,
         })
     }
+    pub(crate) fn finish_host(
+        &self,
+        decoded: Inference,
+        shapes: &[[usize; 2]],
+        options: DetectionOptions,
+    ) -> Result<Vec<Vec<Detection>>> {
+        let selected = self.select(decoded, shapes, options)?;
+        let binding = selected.rows.binding().unwrap();
+        let rows = binding.map_read()?;
+        Ok(selected
+            .offsets
+            .windows(2)
+            .map(|range| {
+                selected.indices[range[0]..range[1]]
+                    .iter()
+                    .map(|&i| {
+                        let row = &rows[i * 64..][..64];
+                        let v: [f32; 15] = std::array::from_fn(|c| {
+                            f32::from_le_bytes(row[c * 4..][..4].try_into().unwrap())
+                        });
+                        Detection {
+                            score: v[0],
+                            bbox: v[1..5].try_into().unwrap(),
+                            landmarks: std::array::from_fn(|c| [v[5 + 2 * c], v[6 + 2 * c]]),
+                        }
+                    })
+                    .collect()
+            })
+            .collect())
+    }
+}
+
+struct Selected {
+    rows: DeviceTensor,
+    indices: Vec<usize>,
+    offsets: Vec<usize>,
+    candidates: Vec<usize>,
 }
 
 /// Selected resident F32 [total_faces,16] rows: score, bbox[4], landmarks[10],
-/// zero padding. CPU selection downloads only candidate scores/boxes and status.
+/// zero padding. CPU selection maps coherent candidate scores/boxes and status.
 /// Image row offsets preserve batch order; gathering is asynchronous.
 pub struct Detections {
     context: ModelContext,

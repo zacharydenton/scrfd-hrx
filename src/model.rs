@@ -131,7 +131,14 @@ pub(crate) fn load(path: &Path) -> Result<Plan> {
                 );
                 let cp = if taps == 9 { align(ci, 8) } else { storage(ci) };
                 let k = align(taps * cp, 32);
-                let n = align(co, 64);
+                // The stem computes only 32 output channels; keep both its
+                // weights and activations narrow. Other weights retain full
+                // WMMA tiles while activation rows use 32-channel alignment.
+                let n = if co <= 32 && taps == 9 && variant == "relu" {
+                    32
+                } else {
+                    align(co, 64)
+                };
                 emit16(
                     &mut weights,
                     name.clone(),
@@ -174,7 +181,8 @@ pub(crate) fn load(path: &Path) -> Result<Plan> {
                     } else {
                         64
                     },
-                    bytes: out[2] * out[3] * n * 2,
+                    cout_stride: storage(co),
+                    bytes: out[2] * out[3] * storage(co) * 2,
                     ..Default::default()
                 });
             }
@@ -285,6 +293,7 @@ pub(crate) fn load(path: &Path) -> Result<Plan> {
             ho: s[2],
             wo: s[3],
             tile: 64,
+            cout_stride: 64,
             bytes: s[2] * s[3] * 64 * 2,
             ..Default::default()
         });

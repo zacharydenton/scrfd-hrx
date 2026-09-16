@@ -165,7 +165,21 @@ fn native_reference_and_replay() -> Result<()> {
     let canvas: Vec<u8> = (0..640 * 640 * 3)
         .map(|i| ((i * 7 + i / 101) % 256) as u8)
         .collect();
-    model.detect_letterboxed(&canvas, &[1.], &[[640, 640]], Default::default())?;
+    let first_detections =
+        model.detect_letterboxed(&canvas, &[1.], &[[640, 640]], Default::default())?;
+    let before = model.context().runtime().statistics();
+    let replay = model.detect_letterboxed(&canvas, &[1.], &[[640, 640]], Default::default())?;
+    assert_eq!(
+        serde_json::to_value(first_detections)?,
+        serde_json::to_value(replay)?
+    );
+    let after = model.context().runtime().statistics();
+    assert_eq!(after.allocations, before.allocations);
+    assert_eq!(after.native_graphs_prepared, before.native_graphs_prepared);
+    assert_eq!(after.device_copied_bytes, before.device_copied_bytes);
+    assert_eq!(after.submissions - before.submissions, 1);
+    assert_eq!(after.uploaded_bytes, before.uploaded_bytes);
+    assert_eq!(after.downloaded_bytes, before.downloaded_bytes);
     let read_heads = |canvases: &[u8]| -> Result<Vec<Vec<half::f16>>> {
         Ok(model
             .cnn
@@ -455,6 +469,14 @@ fn insightface_fixture() -> Result<()> {
         height: h as usize,
     };
     let got = model.detect(image, Default::default())?;
+    let before = model.context().runtime().statistics();
+    let replay = model.detect(image, Default::default())?;
+    let after = model.context().runtime().statistics();
+    assert_eq!(serde_json::to_value(&got)?, serde_json::to_value(&replay)?);
+    assert_eq!(after.allocations, before.allocations);
+    assert_eq!(after.native_graphs_prepared, before.native_graphs_prepared);
+    assert_eq!(after.copied_bytes, before.copied_bytes);
+    assert_eq!(after.submissions - before.submissions, 1);
     assert_eq!(got.len(), expected.len());
     for ((a, b), k) in got.iter().zip(&expected).zip(&kps) {
         let aa = a.bbox;
@@ -468,6 +490,16 @@ fn insightface_fixture() -> Result<()> {
         }
     }
     let batched = model.detect_batch(&[image, image], Default::default())?;
+    let before = model.context().runtime().statistics();
+    let replay = model.detect_batch(&[image, image], Default::default())?;
+    let after = model.context().runtime().statistics();
+    assert_eq!(
+        serde_json::to_value(&batched)?,
+        serde_json::to_value(&replay)?
+    );
+    assert_eq!(after.allocations, before.allocations);
+    assert_eq!(after.native_graphs_prepared, before.native_graphs_prepared);
+    assert_eq!(after.submissions - before.submissions, 1);
     assert_eq!(
         serde_json::to_value(&got)?,
         serde_json::to_value(&batched[0])?
@@ -476,6 +508,33 @@ fn insightface_fixture() -> Result<()> {
         serde_json::to_value(&got)?,
         serde_json::to_value(&batched[1])?
     );
+    // Reuse slots with different pixels, heterogeneous sizes and a partial
+    // final chunk. Compare against the independent CPU letterbox path.
+    let blank = vec![127; 73 * 51 * 3];
+    let blank_image = Image {
+        rgb: &blank,
+        width: 73,
+        height: 51,
+    };
+    for images in [
+        [image, blank_image, image],
+        [blank_image, image, blank_image],
+    ] {
+        let mut canvases = Vec::new();
+        let mut scales = Vec::new();
+        let shapes: Vec<_> = images.iter().map(|i| [i.width, i.height]).collect();
+        for image in images {
+            let (canvas, scale) = detection::letterbox(image)?;
+            canvases.extend(canvas);
+            scales.push(scale);
+        }
+        let expected = model.detect_letterboxed(&canvases, &scales, &shapes, Default::default())?;
+        let actual = model.detect_batch(&images, Default::default())?;
+        assert_eq!(
+            serde_json::to_value(&actual)?,
+            serde_json::to_value(&expected)?
+        );
+    }
     Ok(())
 }
 
@@ -551,12 +610,11 @@ fn gpu_decode_matches_stable_cpu_oracle_and_errors() -> Result<()> {
         let input = upload(&heads)?;
         let before = context.runtime().statistics().downloaded_bytes;
         let detections = decoder.submit(&input, &[0.7, 1.], &[[901, 703], [640, 640]], options)?;
-        let candidate_bytes = detections.candidate_counts().iter().sum::<usize>() as u64 * 20;
         let got = detections.wait()?;
         let downloaded = context.runtime().statistics().downloaded_bytes - before;
         assert_eq!(
             downloaded,
-            16 + candidate_bytes + got.iter().map(|r| r.len() as u64 * 64).sum::<u64>()
+            got.iter().map(|r| r.len() as u64 * 64).sum::<u64>()
         );
         for b in 0..2 {
             let want = detection::decode(
@@ -566,6 +624,14 @@ fn gpu_decode_matches_stable_cpu_oracle_and_errors() -> Result<()> {
                 [[901, 703], [640, 640]][b],
                 options,
             )?;
+            let host = detection::decode_host(
+                &heads,
+                b,
+                [0.7, 1.][b],
+                [[901, 703], [640, 640]][b],
+                options,
+            )?;
+            assert_eq!(serde_json::to_value(host)?, serde_json::to_value(&want)?);
             assert_eq!(got[b].len(), want.len());
             for (a, b) in got[b].iter().zip(&want) {
                 assert_eq!(a.score, b.score);
@@ -697,7 +763,7 @@ fn dense_decode_qualification() -> Result<()> {
                 let after = context.runtime().statistics();
                 assert_eq!(
                     after.downloaded_bytes - before.downloaded_bytes,
-                    8 + count as u64 * 20 + expected.len() as u64 * 64
+                    expected.len() as u64 * 64
                 );
                 if replay == 1 {
                     warmed = Some(after);
@@ -725,6 +791,221 @@ fn dense_decode_qualification() -> Result<()> {
                 &elapsed[1..]
             );
         }
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires gfx1151 and Loom compiler"]
+fn parallel_decode_preserves_block_level_and_tail_order() -> Result<()> {
+    let context = ModelContext::new(Default::default())?;
+    let decoder = postprocess::Postprocess::new(&context)?;
+    let mut heads = [80, 40, 20].map(|size| {
+        let mut v = vec![half::f16::ZERO; 3 * size * size * 64];
+        for row in v.chunks_mut(64) {
+            row[..2].fill(half::f16::from_f32(-10.));
+        }
+        v
+    });
+    for b in [0, 2] {
+        for anchor in [0, 1, 255, 256, 12799, 12800, 15999, 16000, 16799] {
+            let (level, local, size) = if anchor < 12800 {
+                (0, anchor, 80)
+            } else if anchor < 16000 {
+                (1, anchor - 12800, 40)
+            } else {
+                (2, anchor - 16000, 20)
+            };
+            let row = &mut heads[level][(b * size * size + local / 2) * 64..][..64];
+            row[local % 2] = half::f16::from_f32(0.75);
+            for ch in 0..10 {
+                row[10 + (local % 2) * 10 + ch] = half::f16::from_f32(ch as f32 / 4.);
+            }
+        }
+    }
+    let input = heads
+        .iter()
+        .zip([80, 40, 20])
+        .map(|(h, size)| {
+            context.upload(
+                TensorDesc::new(DType::F16, vec![3, size, size, 64])?.with_layout(Layout::Nhwc)?,
+                bytemuck::cast_slice(h),
+            )
+        })
+        .collect::<hrx::Result<Vec<_>>>()?;
+    for capacity in [9, 10, 16800] {
+        let options = DetectionOptions {
+            max_candidates: capacity,
+            ..Default::default()
+        };
+        let got = decoder
+            .submit(&input, &[1.; 3], &[[640, 640]; 3], options)?
+            .wait()?;
+        for (b, rows) in got.iter().enumerate() {
+            let want = detection::decode(&heads, b, 1., [640, 640], options)?;
+            assert_eq!(serde_json::to_value(rows)?, serde_json::to_value(want)?);
+        }
+        assert!(got[1].is_empty());
+    }
+    assert!(
+        decoder
+            .submit(
+                &input,
+                &[1.; 3],
+                &[[640, 640]; 3],
+                DetectionOptions {
+                    max_candidates: 8,
+                    ..Default::default()
+                }
+            )
+            .is_err()
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires pretrained weights and gfx1151"]
+fn detect_batch_uses_shared_decoder_with_cached_options() -> Result<()> {
+    let source = image::load_from_memory(include_bytes!("../tests/fixtures/t1.png"))?.to_rgb8();
+    let (width, height) = source.dimensions();
+    let image = Image {
+        rgb: source.as_raw(),
+        width: width as usize,
+        height: height as usize,
+    };
+    let blank = vec![127; image.rgb.len()];
+    let images = [
+        image,
+        Image {
+            rgb: &blank,
+            ..image
+        },
+        image,
+    ];
+    let model = Scrfd::load(
+        model_path()?,
+        Options {
+            device: 0,
+            max_batch: 2,
+        },
+    )?;
+    // Capture dense heads solely for an independent CPU oracle. Production
+    // detect_batch must never use this readback path.
+    let mut reference_heads = Vec::new();
+    let mut scales = Vec::new();
+    for input in &images {
+        let (canvas, scale) = detection::letterbox(*input)?;
+        let bytes = model
+            .cnn
+            .prepare(1)?
+            .submit_host(&[&canvas])?
+            .download()?
+            .wait()?;
+        reference_heads.push(
+            bytes
+                .into_iter()
+                .map(|bytes| {
+                    bytes
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
+                        .map(|v| half::f16::from_le_bytes(*v))
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>(),
+        );
+        scales.push(scale);
+    }
+    for options in [
+        DetectionOptions::default(),
+        DetectionOptions {
+            threshold: 0.3,
+            ..Default::default()
+        },
+        DetectionOptions {
+            threshold: 0.7,
+            max_detections: 1,
+            ranking: Ranking::Area,
+            ..Default::default()
+        },
+        DetectionOptions {
+            threshold: 0.7,
+            max_detections: 1,
+            ranking: Ranking::AreaAndCenter,
+            ..Default::default()
+        },
+        DetectionOptions {
+            max_candidates: 16800,
+            nms_threshold: 0.2,
+            ..Default::default()
+        },
+    ] {
+        let expected = reference_heads
+            .iter()
+            .zip(&scales)
+            .map(|(heads, &scale)| {
+                detection::decode(heads, 0, scale, [image.width, image.height], options)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        assert_eq!(
+            serde_json::to_value(model.detect_batch(&images, options)?)?,
+            serde_json::to_value(&expected)?
+        );
+        let before = model.context().runtime().statistics();
+        let actual = model.detect_batch(&images, options)?;
+        let after = model.context().runtime().statistics();
+        assert_eq!(
+            serde_json::to_value(actual)?,
+            serde_json::to_value(&expected)?
+        );
+        assert_eq!(
+            after.submissions - before.submissions,
+            2,
+            "one composed submission per chunk"
+        );
+        assert_eq!(
+            after.copied_bytes, before.copied_bytes,
+            "no dense head readback or canvas concatenation copies"
+        );
+        assert_eq!(after.allocations, before.allocations);
+    }
+    assert!(
+        model
+            .detect_batch(
+                &[image],
+                DetectionOptions {
+                    max_candidates: 1,
+                    ..Default::default()
+                }
+            )
+            .is_err()
+    );
+    assert!(!model.detect_batch(&[image], Default::default())?[0].is_empty());
+    assert!(model.detect_batch(&[], Default::default())?.is_empty());
+    // Multiple equal-sized runs must keep their byte offsets and image order
+    // when concatenating a heterogeneous batch.
+    let mixed_model = Scrfd::load(
+        model_path()?,
+        Options {
+            device: 0,
+            max_batch: 4,
+        },
+    )?;
+    let odd_pixels = vec![127; 73 * 51 * 3];
+    let odd = Image {
+        rgb: &odd_pixels,
+        width: 73,
+        height: 51,
+    };
+    for images in [[image, image, odd, odd], [odd, image, image, odd]] {
+        let expected = images
+            .iter()
+            .map(|&input| model.detect(input, Default::default()))
+            .collect::<Result<Vec<_>>>()?;
+        assert_eq!(
+            serde_json::to_value(mixed_model.detect_batch(&images, Default::default())?)?,
+            serde_json::to_value(expected)?
+        );
     }
     Ok(())
 }

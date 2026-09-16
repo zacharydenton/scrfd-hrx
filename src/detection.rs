@@ -105,11 +105,10 @@ fn letterbox_into(
     Ok(h as f32 / image.height as f32)
 }
 #[cfg(test)]
-pub(crate) fn decode(
-    heads: &[Vec<half::f16>],
+fn decode_candidates(
+    heads: &[impl AsRef<[half::f16]>],
     batch: usize,
     scale: f32,
-    shape: [usize; 2],
     options: DetectionOptions,
 ) -> Result<Vec<Detection>> {
     let mut candidates = vec![];
@@ -120,7 +119,7 @@ pub(crate) fn decode(
         let stride = (640 / size) as f32;
         for y in 0..size {
             for x in 0..size {
-                let row = &heads[level][((batch * size + y) * size + x) * 64..][..64];
+                let row = &heads[level].as_ref()[((batch * size + y) * size + x) * 64..][..64];
                 for a in 0..2 {
                     let logit = row[a].to_f32();
                     ensure!(logit.is_finite(), "non-finite detector logit");
@@ -168,7 +167,39 @@ pub(crate) fn decode(
             }
         }
     }
-    Ok(suppress_reference(candidates, shape, options))
+    Ok(candidates)
+}
+
+/// Independent host decoding oracle for numerical tests only.
+#[cfg(test)]
+pub(crate) fn decode_host(
+    heads: &[impl AsRef<[half::f16]>],
+    batch: usize,
+    scale: f32,
+    shape: [usize; 2],
+    options: DetectionOptions,
+) -> Result<Vec<Detection>> {
+    Ok(suppress(
+        decode_candidates(heads, batch, scale, options)?,
+        shape,
+        options,
+    ))
+}
+
+// Keep the frozen independent selector as the GPU postprocessing oracle.
+#[cfg(test)]
+pub(crate) fn decode(
+    heads: &[Vec<half::f16>],
+    batch: usize,
+    scale: f32,
+    shape: [usize; 2],
+    options: DetectionOptions,
+) -> Result<Vec<Detection>> {
+    Ok(suppress_reference(
+        decode_candidates(heads, batch, scale, options)?,
+        shape,
+        options,
+    ))
 }
 /// Inclusive-coordinate greedy NMS, followed by optional InsightFace ranking.
 pub fn suppress(

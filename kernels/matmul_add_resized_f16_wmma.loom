@@ -19,6 +19,7 @@ amdgpu.target<gfx11-generic> @dinov3_matmul_wmma_af16_cf16_gfx11 {subgroup_size 
 config.decl @scrfd.matmul_add_resized_f16_wmma.k_size : %value: index where [range(%value, 32, 8192), mul(%value, 32)]
 
 config.decl @scrfd.matmul_add_resized_f16_wmma.n_size : %value: index where [range(%value, 64, 8192), mul(%value, 64)]
+config.decl @scrfd.matmul_add_resized_f16_wmma.n_stride : %value: index where [range(%value, 32, 8192), mul(%value, 32)]
 
 // Fine output height/width; the coarse tensor is half of each, same channels.
 config.decl @scrfd.matmul_add_resized_f16_wmma.height : %value: index where [range(%value, 2, 4096), mul(%value, 2)]
@@ -40,6 +41,8 @@ kernel.def target(@dinov3_matmul_wmma_af16_cf16_gfx11) export("scrfd_matmul_add_
   %n_size0 = config.get @scrfd.matmul_add_resized_f16_wmma.n_size : index
   %k_size = index.assume %k_size0 [range(%k_size0, 32, 8192), mul(%k_size0, 32)] : index
   %n_size = index.assume %n_size0 [range(%n_size0, 64, 8192), mul(%n_size0, 64)] : index
+  %n_stride0 = config.get @scrfd.matmul_add_resized_f16_wmma.n_stride : index
+  %n_stride = index.assume %n_stride0 [range(%n_stride0, 32, 8192), mul(%n_stride0, 32)] : index
 
   %c0 = index.constant 0 : index
   %c1 = index.constant 1 : index
@@ -84,7 +87,7 @@ kernel.def target(@dinov3_matmul_wmma_af16_cf16_gfx11) export("scrfd_matmul_add_
   %a_view = buffer.view %a_global[%c0_offset] : buffer -> view<[%m_size]x[%k_size]xf16>
   %w_view = buffer.view %w_global[%c0_offset] : buffer -> view<[%n_size]x[%k_size]xf16>
   %bias_view = buffer.view %bias_global[%c0_offset] : buffer -> view<[%n_size]xf32>
-  %c_view = buffer.view %c_global[%c0_offset] : buffer -> view<[%m_size]x[%n_size]xf16>
+  %c_view = buffer.view %c_global[%c0_offset] : buffer -> view<[%m_size]x[%n_stride]xf16>
   %height = config.get @scrfd.matmul_add_resized_f16_wmma.height : index
   %width = config.get @scrfd.matmul_add_resized_f16_wmma.width : index
   %c2_r = index.constant 2 : index
@@ -96,7 +99,7 @@ kernel.def target(@dinov3_matmul_wmma_af16_cf16_gfx11) export("scrfd_matmul_add_
   %images = index.div %m_bounded, %plane : index
   %coarse_rows = index.mul %images, %coarse_plane : index
   %coarse_global = buffer.assume.memory_space<global> %coarse : buffer
-  %coarse_view = buffer.view %coarse_global[%c0_offset] : buffer -> view<[%coarse_rows]x[%n_size]xf16>
+  %coarse_view = buffer.view %coarse_global[%c0_offset] : buffer -> view<[%coarse_rows]x[%n_stride]xf16>
 
   %a_stage = buffer.alloca<workgroup> align(16) %a_stage_bytes : buffer
   %w_stage = buffer.alloca<workgroup> align(16) %w_stage_bytes : buffer
@@ -177,8 +180,12 @@ kernel.def target(@dinov3_matmul_wmma_af16_cf16_gfx11) export("scrfd_matmul_add_
       %biased = vector.addf %values, %bias_values : vector<4xf32>
       %row_local = index.add %wave_row, %publish_row : index
       %out_row = index.add %base_m, %row_local : index
-      %writes = index.cmp ult, %out_row, %m_size : index
+      %row_writes = index.cmp ult, %out_row, %m_size : index
+      %out_limit = index.sub %n_stride, %c4 : index
+      %channel_writes = index.cmp ule, %out_col, %out_limit : index
+      %writes = scalar.andi %row_writes, %channel_writes : i1
       scf.if %writes {
+        %safe_out_col = index.assume %out_col [le(%out_col, %out_limit), mul(%out_col, 4)] : index
         %bounded = index.assume %out_row [lt(%out_row, %m_size)] : index
         // fine row m = (b*H + y)*W + x  ->  coarse row (b*H/2 + y/2)*W/2 + x/2
         %image = index.div %bounded, %plane : index
@@ -192,11 +199,11 @@ kernel.def target(@dinov3_matmul_wmma_af16_cf16_gfx11) export("scrfd_matmul_add_
         %row_cw = index.mul %row_c0, %half_w : index
         %coarse_row0 = index.add %row_cw, %xc : index
         %coarse_row = index.assume %coarse_row0 [lt(%coarse_row0, %coarse_rows)] : index
-        %prior_half = vector.load %coarse_view[%coarse_row, %out_col] : view<[%coarse_rows]x[%n_size]xf16> -> vector<4xf16>
+        %prior_half = vector.load %coarse_view[%coarse_row, %safe_out_col] : view<[%coarse_rows]x[%n_stride]xf16> -> vector<4xf16>
         %prior = vector.extf %prior_half : vector<4xf16> to vector<4xf32>
         %summed = vector.addf %biased, %prior : vector<4xf32>
         %narrow = vector.fptrunc %summed : vector<4xf32> to vector<4xf16>
-        vector.store %narrow, %c_view[%bounded, %out_col] : vector<4xf16>, view<[%m_size]x[%n_size]xf16>
+        vector.store %narrow, %c_view[%bounded, %safe_out_col] : vector<4xf16>, view<[%m_size]x[%n_stride]xf16>
       }
     }
     kernel.barrier<workgroup> scope(subgroup) ordering(acq_rel)

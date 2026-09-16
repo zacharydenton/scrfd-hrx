@@ -1,5 +1,10 @@
 # Postprocessing qualification
 
+The [2026-09-17 parallel decoder](parallel-decode-2026-09-17.md) supersedes
+the serial hybrid timings below; the original measurements remain historical.
+The [unified public batch pipeline](detect-batch-2026-09-17.md) also eliminates
+metadata readback copies using coherent buffers.
+
 The hybrid pipeline uses GPU decode/compaction, CPU stable NMS/ranking, and
 shared HRX GPU row gathering. CPU selection receives only scores and boxes;
 landmarks stay on-device. This is the production path, not a failure fallback.

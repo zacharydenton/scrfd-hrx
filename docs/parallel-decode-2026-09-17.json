@@ -1,0 +1,274 @@
+{
+  "metadata": {
+    "date": "2026-09-17",
+    "device": "gfx1151",
+    "hrx_working_patch_sha256": "5206d2cab30d74de28d5de67e7450ddbad05e8b2885c6312a47b02fdcc32fa54",
+    "method": "Frozen identical HRX sources; before/after/after/before; synchronized warm host latency; other GPU workloads left running."
+  },
+  "runs": [
+    {
+      "variant": "before",
+      "case": "disjoint",
+      "candidates": 256,
+      "kept": 256,
+      "warm_ms": [
+        5.785095,
+        5.641738,
+        5.633549
+      ]
+    },
+    {
+      "variant": "before",
+      "case": "overlapping",
+      "candidates": 256,
+      "kept": 2,
+      "warm_ms": [
+        5.466044,
+        5.468953,
+        5.23621
+      ]
+    },
+    {
+      "variant": "before",
+      "case": "ranked",
+      "candidates": 256,
+      "kept": 16,
+      "warm_ms": [
+        5.586519,
+        5.437624,
+        5.394895
+      ]
+    },
+    {
+      "variant": "before",
+      "case": "disjoint",
+      "candidates": 4096,
+      "kept": 4096,
+      "warm_ms": [
+        35.930284,
+        34.838034,
+        35.799068
+      ]
+    },
+    {
+      "variant": "before",
+      "case": "overlapping",
+      "candidates": 4096,
+      "kept": 7,
+      "warm_ms": [
+        17.341554,
+        18.199571,
+        17.631266
+      ]
+    },
+    {
+      "variant": "before",
+      "case": "ranked",
+      "candidates": 4096,
+      "kept": 16,
+      "warm_ms": [
+        33.759282,
+        34.745616,
+        33.588658
+      ]
+    },
+    {
+      "variant": "after",
+      "case": "disjoint",
+      "candidates": 256,
+      "kept": 256,
+      "warm_ms": [
+        0.5339360000000001,
+        0.800159,
+        0.5107269999999999
+      ]
+    },
+    {
+      "variant": "after",
+      "case": "overlapping",
+      "candidates": 256,
+      "kept": 2,
+      "warm_ms": [
+        0.37671,
+        0.460518,
+        0.42083800000000005
+      ]
+    },
+    {
+      "variant": "after",
+      "case": "ranked",
+      "candidates": 256,
+      "kept": 16,
+      "warm_ms": [
+        0.47240699999999997,
+        0.6228239999999999,
+        0.560235
+      ]
+    },
+    {
+      "variant": "after",
+      "case": "disjoint",
+      "candidates": 4096,
+      "kept": 4096,
+      "warm_ms": [
+        18.686878,
+        18.59957,
+        17.877009
+      ]
+    },
+    {
+      "variant": "after",
+      "case": "overlapping",
+      "candidates": 4096,
+      "kept": 7,
+      "warm_ms": [
+        0.574765,
+        0.566744,
+        0.532956
+      ]
+    },
+    {
+      "variant": "after",
+      "case": "ranked",
+      "candidates": 4096,
+      "kept": 16,
+      "warm_ms": [
+        18.010496,
+        18.019326,
+        18.62785
+      ]
+    },
+    {
+      "variant": "after",
+      "case": "disjoint",
+      "candidates": 256,
+      "kept": 256,
+      "warm_ms": [
+        0.977993,
+        0.6257240000000001,
+        0.615483
+      ]
+    },
+    {
+      "variant": "after",
+      "case": "overlapping",
+      "candidates": 256,
+      "kept": 2,
+      "warm_ms": [
+        0.481257,
+        0.474188,
+        0.37388
+      ]
+    },
+    {
+      "variant": "after",
+      "case": "ranked",
+      "candidates": 256,
+      "kept": 16,
+      "warm_ms": [
+        0.594754,
+        0.6226029999999999,
+        0.567395
+      ]
+    },
+    {
+      "variant": "after",
+      "case": "disjoint",
+      "candidates": 4096,
+      "kept": 4096,
+      "warm_ms": [
+        18.684968,
+        18.146672,
+        18.664548
+      ]
+    },
+    {
+      "variant": "after",
+      "case": "overlapping",
+      "candidates": 4096,
+      "kept": 7,
+      "warm_ms": [
+        0.699032,
+        0.5255359999999999,
+        1.575707
+      ]
+    },
+    {
+      "variant": "after",
+      "case": "ranked",
+      "candidates": 4096,
+      "kept": 16,
+      "warm_ms": [
+        18.476703,
+        18.402406,
+        18.425734
+      ]
+    },
+    {
+      "variant": "before",
+      "case": "disjoint",
+      "candidates": 256,
+      "kept": 256,
+      "warm_ms": [
+        5.805524,
+        5.490933,
+        5.470953
+      ]
+    },
+    {
+      "variant": "before",
+      "case": "overlapping",
+      "candidates": 256,
+      "kept": 2,
+      "warm_ms": [
+        5.467573,
+        5.327667,
+        5.262608
+      ]
+    },
+    {
+      "variant": "before",
+      "case": "ranked",
+      "candidates": 256,
+      "kept": 16,
+      "warm_ms": [
+        5.650328,
+        5.403244,
+        5.637139
+      ]
+    },
+    {
+      "variant": "before",
+      "case": "disjoint",
+      "candidates": 4096,
+      "kept": 4096,
+      "warm_ms": [
+        35.770219,
+        34.771056,
+        35.153595
+      ]
+    },
+    {
+      "variant": "before",
+      "case": "overlapping",
+      "candidates": 4096,
+      "kept": 7,
+      "warm_ms": [
+        17.746093,
+        17.235257,
+        17.895998
+      ]
+    },
+    {
+      "variant": "before",
+      "case": "ranked",
+      "candidates": 4096,
+      "kept": 16,
+      "warm_ms": [
+        34.364647,
+        36.100039,
+        35.654382
+      ]
+    }
+  ]
+}

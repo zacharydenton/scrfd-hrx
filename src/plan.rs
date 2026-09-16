@@ -15,7 +15,10 @@ pub(crate) struct Op {
     pub cin_pad: usize,
     pub cin_stride: usize,
     pub k: usize,
+    /// Output channels packed in the weight matrix, rounded for WMMA tiles.
     pub n: usize,
+    /// Physical output activation channels; independent of the weight tile width.
+    pub cout_stride: usize,
     pub ho: usize,
     pub wo: usize,
     pub tile: usize,
@@ -36,7 +39,7 @@ pub(crate) fn align(n: usize, a: usize) -> usize {
     n.div_ceil(a) * a
 }
 pub(crate) fn storage(c: usize) -> usize {
-    if c <= 8 { 8 } else { align(c, 64) }
+    if c <= 8 { 8 } else { align(c, 32) }
 }
 pub(crate) fn emit32(weights: &mut HashMap<String, Vec<u8>>, name: String, v: &[f64]) {
     weights.insert(

@@ -47,8 +47,12 @@ landmarks to [arcface-hrx](https://github.com/zacharydenton/arcface-hrx).
 
 Decoding and candidate compaction run on the GPU. Stable NMS and result ranking
 run on the CPU using only candidate scores and boxes (20 bytes per candidate).
-Selected indices go back to a shared HRX row gather; landmarks remain resident.
-Host detection additionally downloads the selected full rows, not dense CNN heads.
+All detection entry points share this decoder and selector. `detect_batch`
+composes resizing, CNN inference and decoding into one graph per chunk. It
+reads compact metadata and selected rows directly from coherent host-visible
+storage, without copying dense CNN heads. Equal-sized consecutive images share
+batched resize storage, eliminating the canvas concatenation copy. The resident
+API gathers the selected rows on the GPU for downstream model consumption.
 Exceeding `max_candidates` is an error, not silent truncation; non-finite model
 predictions are also rejected.
 
@@ -60,7 +64,8 @@ F32 `[total_faces,16]`; `counts` waits for gathering and returns per-image count
 downloads selected rows. Both `detect_batch` and resident `letterbox` use shared GPU integer
 bilinear resize, byte-exact against the former CPU implementation on the tested
 fixtures. The hybrid path preserves stable score ties and greedy NMS ordering;
-see [postprocessing qualification](docs/postprocessing-qualification.md).
+see [public batch measurements](docs/detect-batch-2026-09-17.md) and
+[postprocessing qualification](docs/postprocessing-qualification.md).
 
 ## Weights
 
@@ -84,7 +89,8 @@ cargo test --release -- --include-ignored --test-threads=1
 Ignored tests require model weights and, for inference, `gfx1151`. Set
 `SCRFD_MODEL` to use local weights. Run `cargo doc --open` for API docs.
 
-See [benchmarks and kernel details](docs/kernels-2026-09-10.md) and the
+See [CNN batch latency and memory measurements](docs/cnn-layout-2026-09-17.md),
+[earlier kernel measurements](docs/kernels-2026-09-10.md) and the
 [changelog](CHANGELOG.md).
 
 ## License

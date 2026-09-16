@@ -1,0 +1,195 @@
+// Stable parallel SCRFD compaction. Anchor order is level, pixel, anchor.
+amdgpu.target<gfx11-generic> @target {subgroup_size = 32}
+kernel.def target(@target) export("prefix_groups") @prefix_groups(%unused:index) {
+ %one=index.constant 1 : index
+ %threads=index.constant 256 : index
+ %gx=index.constant 1 : index
+ %gy=index.constant @BATCH@ : index
+ kernel.launch.config workgroups(%gx,%gy,%one) workgroup_size(%threads,%one,%one) : index
+} launch(%unused:index,%groups:buffer,%offsets:buffer,%status:buffer) {
+ %off=index.constant 0 : offset
+ %zero=index.constant 0 : index
+ %one=index.constant 1 : index
+ %two=index.constant 2 : index
+ %threads=index.constant 256 : index
+ %lane=kernel.workitem.id<x> : index
+ %group_raw=kernel.workgroup.id<x> : index
+ %group=index.assume %group_raw [range(%group_raw,0,65)] : index
+ %br=kernel.workgroup.id<y> : index
+ %b=index.assume %br [range(%br,0,@LAST_BATCH@)] : index
+ %i0=scalar.constant 0 : i32
+ %i1=scalar.constant 1 : i32
+ %i4=scalar.constant 4 : i32
+ %limit=index.constant 66 : index
+ %valid=index.cmp ult,%lane,%limit : index
+ %count,%error=scf.if %valid -> (i32,i32) {
+  %g=index.assume %lane [range(%lane,0,65)] : index
+  %gv=buffer.view %groups[%off] : buffer -> view<@BATCH@x66x2xi32>
+  %c=view.load %gv[%b,%g,%zero] : view<@BATCH@x66x2xi32> -> i32
+  %e=view.load %gv[%b,%g,%one] : view<@BATCH@x66x2xi32> -> i32
+  scf.yield %c,%e : i32,i32
+ } else { scf.yield %i0,%i0 : i32,i32 }
+ %shared_bytes=index.constant 2048 : offset
+ %lds=buffer.alloca<workgroup> align(16) %shared_bytes : buffer
+ %scan=buffer.view %lds[%off] : buffer -> view<2x256xi32>
+ view.store %count,%scan[%zero,%lane] : i32,view<2x256xi32>
+ view.store %error,%scan[%one,%lane] : i32,view<2x256xi32>
+ kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
+ %d1=index.constant 1 : index
+ %has1=index.cmp uge,%lane,%d1 : index
+ %lc1=view.load %scan[%zero,%lane] : view<2x256xi32> -> i32
+ %le1=view.load %scan[%one,%lane] : view<2x256xi32> -> i32
+ %pc1,%pe1=scf.if %has1 -> (i32,i32) {
+  %prior1=index.sub %lane,%d1 : index
+  %safe1=index.assume %prior1 [range(%prior1,0,255)] : index
+  %c1=view.load %scan[%zero,%safe1] : view<2x256xi32> -> i32
+  %e1=view.load %scan[%one,%safe1] : view<2x256xi32> -> i32
+  scf.yield %c1,%e1 : i32,i32
+ } else { scf.yield %i0,%i0 : i32,i32 }
+ %nc1=scalar.addi %lc1,%pc1 : i32
+ %ne1=scalar.ori %le1,%pe1 : i32
+ kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
+ view.store %nc1,%scan[%zero,%lane] : i32,view<2x256xi32>
+ view.store %ne1,%scan[%one,%lane] : i32,view<2x256xi32>
+ kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
+ %d2=index.constant 2 : index
+ %has2=index.cmp uge,%lane,%d2 : index
+ %lc2=view.load %scan[%zero,%lane] : view<2x256xi32> -> i32
+ %le2=view.load %scan[%one,%lane] : view<2x256xi32> -> i32
+ %pc2,%pe2=scf.if %has2 -> (i32,i32) {
+  %prior2=index.sub %lane,%d2 : index
+  %safe2=index.assume %prior2 [range(%prior2,0,255)] : index
+  %c2=view.load %scan[%zero,%safe2] : view<2x256xi32> -> i32
+  %e2=view.load %scan[%one,%safe2] : view<2x256xi32> -> i32
+  scf.yield %c2,%e2 : i32,i32
+ } else { scf.yield %i0,%i0 : i32,i32 }
+ %nc2=scalar.addi %lc2,%pc2 : i32
+ %ne2=scalar.ori %le2,%pe2 : i32
+ kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
+ view.store %nc2,%scan[%zero,%lane] : i32,view<2x256xi32>
+ view.store %ne2,%scan[%one,%lane] : i32,view<2x256xi32>
+ kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
+ %d4=index.constant 4 : index
+ %has4=index.cmp uge,%lane,%d4 : index
+ %lc4=view.load %scan[%zero,%lane] : view<2x256xi32> -> i32
+ %le4=view.load %scan[%one,%lane] : view<2x256xi32> -> i32
+ %pc4,%pe4=scf.if %has4 -> (i32,i32) {
+  %prior4=index.sub %lane,%d4 : index
+  %safe4=index.assume %prior4 [range(%prior4,0,255)] : index
+  %c4=view.load %scan[%zero,%safe4] : view<2x256xi32> -> i32
+  %e4=view.load %scan[%one,%safe4] : view<2x256xi32> -> i32
+  scf.yield %c4,%e4 : i32,i32
+ } else { scf.yield %i0,%i0 : i32,i32 }
+ %nc4=scalar.addi %lc4,%pc4 : i32
+ %ne4=scalar.ori %le4,%pe4 : i32
+ kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
+ view.store %nc4,%scan[%zero,%lane] : i32,view<2x256xi32>
+ view.store %ne4,%scan[%one,%lane] : i32,view<2x256xi32>
+ kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
+ %d8=index.constant 8 : index
+ %has8=index.cmp uge,%lane,%d8 : index
+ %lc8=view.load %scan[%zero,%lane] : view<2x256xi32> -> i32
+ %le8=view.load %scan[%one,%lane] : view<2x256xi32> -> i32
+ %pc8,%pe8=scf.if %has8 -> (i32,i32) {
+  %prior8=index.sub %lane,%d8 : index
+  %safe8=index.assume %prior8 [range(%prior8,0,255)] : index
+  %c8=view.load %scan[%zero,%safe8] : view<2x256xi32> -> i32
+  %e8=view.load %scan[%one,%safe8] : view<2x256xi32> -> i32
+  scf.yield %c8,%e8 : i32,i32
+ } else { scf.yield %i0,%i0 : i32,i32 }
+ %nc8=scalar.addi %lc8,%pc8 : i32
+ %ne8=scalar.ori %le8,%pe8 : i32
+ kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
+ view.store %nc8,%scan[%zero,%lane] : i32,view<2x256xi32>
+ view.store %ne8,%scan[%one,%lane] : i32,view<2x256xi32>
+ kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
+ %d16=index.constant 16 : index
+ %has16=index.cmp uge,%lane,%d16 : index
+ %lc16=view.load %scan[%zero,%lane] : view<2x256xi32> -> i32
+ %le16=view.load %scan[%one,%lane] : view<2x256xi32> -> i32
+ %pc16,%pe16=scf.if %has16 -> (i32,i32) {
+  %prior16=index.sub %lane,%d16 : index
+  %safe16=index.assume %prior16 [range(%prior16,0,255)] : index
+  %c16=view.load %scan[%zero,%safe16] : view<2x256xi32> -> i32
+  %e16=view.load %scan[%one,%safe16] : view<2x256xi32> -> i32
+  scf.yield %c16,%e16 : i32,i32
+ } else { scf.yield %i0,%i0 : i32,i32 }
+ %nc16=scalar.addi %lc16,%pc16 : i32
+ %ne16=scalar.ori %le16,%pe16 : i32
+ kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
+ view.store %nc16,%scan[%zero,%lane] : i32,view<2x256xi32>
+ view.store %ne16,%scan[%one,%lane] : i32,view<2x256xi32>
+ kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
+ %d32=index.constant 32 : index
+ %has32=index.cmp uge,%lane,%d32 : index
+ %lc32=view.load %scan[%zero,%lane] : view<2x256xi32> -> i32
+ %le32=view.load %scan[%one,%lane] : view<2x256xi32> -> i32
+ %pc32,%pe32=scf.if %has32 -> (i32,i32) {
+  %prior32=index.sub %lane,%d32 : index
+  %safe32=index.assume %prior32 [range(%prior32,0,255)] : index
+  %c32=view.load %scan[%zero,%safe32] : view<2x256xi32> -> i32
+  %e32=view.load %scan[%one,%safe32] : view<2x256xi32> -> i32
+  scf.yield %c32,%e32 : i32,i32
+ } else { scf.yield %i0,%i0 : i32,i32 }
+ %nc32=scalar.addi %lc32,%pc32 : i32
+ %ne32=scalar.ori %le32,%pe32 : i32
+ kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
+ view.store %nc32,%scan[%zero,%lane] : i32,view<2x256xi32>
+ view.store %ne32,%scan[%one,%lane] : i32,view<2x256xi32>
+ kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
+ %d64=index.constant 64 : index
+ %has64=index.cmp uge,%lane,%d64 : index
+ %lc64=view.load %scan[%zero,%lane] : view<2x256xi32> -> i32
+ %le64=view.load %scan[%one,%lane] : view<2x256xi32> -> i32
+ %pc64,%pe64=scf.if %has64 -> (i32,i32) {
+  %prior64=index.sub %lane,%d64 : index
+  %safe64=index.assume %prior64 [range(%prior64,0,255)] : index
+  %c64=view.load %scan[%zero,%safe64] : view<2x256xi32> -> i32
+  %e64=view.load %scan[%one,%safe64] : view<2x256xi32> -> i32
+  scf.yield %c64,%e64 : i32,i32
+ } else { scf.yield %i0,%i0 : i32,i32 }
+ %nc64=scalar.addi %lc64,%pc64 : i32
+ %ne64=scalar.ori %le64,%pe64 : i32
+ kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
+ view.store %nc64,%scan[%zero,%lane] : i32,view<2x256xi32>
+ view.store %ne64,%scan[%one,%lane] : i32,view<2x256xi32>
+ kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
+ %d128=index.constant 128 : index
+ %has128=index.cmp uge,%lane,%d128 : index
+ %lc128=view.load %scan[%zero,%lane] : view<2x256xi32> -> i32
+ %le128=view.load %scan[%one,%lane] : view<2x256xi32> -> i32
+ %pc128,%pe128=scf.if %has128 -> (i32,i32) {
+  %prior128=index.sub %lane,%d128 : index
+  %safe128=index.assume %prior128 [range(%prior128,0,255)] : index
+  %c128=view.load %scan[%zero,%safe128] : view<2x256xi32> -> i32
+  %e128=view.load %scan[%one,%safe128] : view<2x256xi32> -> i32
+  scf.yield %c128,%e128 : i32,i32
+ } else { scf.yield %i0,%i0 : i32,i32 }
+ %nc128=scalar.addi %lc128,%pc128 : i32
+ %ne128=scalar.ori %le128,%pe128 : i32
+ kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
+ view.store %nc128,%scan[%zero,%lane] : i32,view<2x256xi32>
+ view.store %ne128,%scan[%one,%lane] : i32,view<2x256xi32>
+ kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
+ %inclusive=view.load %scan[%zero,%lane] : view<2x256xi32> -> i32
+ scf.if %valid {
+  %g=index.assume %lane [range(%lane,0,65)] : index
+  %ov=buffer.view %offsets[%off] : buffer -> view<@BATCH@x66xi32>
+  %exclusive=scalar.subi %inclusive,%count : i32
+  view.store %exclusive,%ov[%b,%g] : i32,view<@BATCH@x66xi32>
+ }
+ %last=index.constant 65 : index
+ %leader=index.cmp eq,%lane,%last : index
+ scf.if %leader {
+  %errors=view.load %scan[%one,%lane] : view<2x256xi32> -> i32
+  %cap=scalar.constant @CAP@ : i32
+  %overflow=scalar.cmpi ugt,%inclusive,%cap : i32
+  %flag=scf.select %overflow,%i4,%i0 : i32
+  %combined=scalar.ori %errors,%flag : i32
+  %count_capped=scf.select %overflow,%cap,%inclusive : i32
+  %sv=buffer.view %status[%off] : buffer -> view<@BATCH@x2xi32>
+  view.store %combined,%sv[%b,%zero] : i32,view<@BATCH@x2xi32>
+  view.store %count_capped,%sv[%b,%one] : i32,view<@BATCH@x2xi32>
+ }
+ kernel.return
+}

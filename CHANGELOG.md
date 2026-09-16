@@ -2,12 +2,19 @@
 
 ## Unreleased
 
+- Use HRX 0.7 to compose resize, inference and parallel candidate decoding in
+  one graph with directly mapped IO. Retain stable CPU selection/NMS.
+- Cache threshold/capacity-specific decode plans and preserve candidate order,
+  ties, detection limits and error behavior against the independent CPU oracle.
+- Align physical activation strides to 32 channels and bound tile stores,
+  reducing padding traffic and resident allocation sizes.
+
 - Use HRX 0.5's shared Hugging Face resolver, checked ONNX loader, scratch
   planner, compiler selection, and top-level `hrx::model` API.
 - Reject unsupported SCRFD head pipelines and invalid tensor ranks during model loading instead of silently changing scores or panicking.
 - Accept RGB throughout: rename `Image::bgr` to `Image::rgb` and pass RGB canvases to `detect_letterboxed`. BGR callers must swap red and blue before calling.
 - Normalize and pad each input pixel with one vector store in the GPU preprocessing kernel.
-- Use a 32-channel implicit-GEMM tile for the two 28-channel stem convolutions, preserving zeroed 64-channel storage.
+- Use a 32-channel implicit-GEMM tile and zeroed 32-channel storage for the two 28-channel stem convolutions.
 - Fetch pinned pretrained weights through the shared Hugging Face cache by default; retain local-file and offline loading.
 - Require Rust 1.91 for the HF Hub 1.0 dependency stack.
 

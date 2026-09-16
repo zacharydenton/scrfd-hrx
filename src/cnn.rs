@@ -3,7 +3,7 @@ use anyhow::{Result, ensure};
 use hrx::{
     inference::{ModelContext, PreparedModel},
     loom::Specialization,
-    model::{Command, Dispatch, KernelId, ModelDefinition, ModelSession, Region},
+    model::{Command, Dispatch, KernelId, ModelDefinition, ModelFragment, ModelSession, Region},
     plan_cache::PlanCache,
     tensor::{DType, Layout, TensorDesc},
 };
@@ -75,105 +75,109 @@ impl Cnn {
         })
     }
     pub fn prepare(&self, batch: usize) -> Result<std::sync::Arc<PreparedModel>> {
-        ensure!((1..=self.max_batch).contains(&batch), "invalid batch size");
         Ok(self.plans.get_or_prepare(batch, || {
-            let shaped = |region: Region| region.slice(0, region.len() / self.max_batch * batch);
-            let mut commands = vec![];
-            for (kernel, l) in self.ops.iter().enumerate() {
-                let src = if l.src_buf == usize::MAX {
-                    shaped(self.input)?
-                } else {
-                    shaped(self.buffers[l.src_buf])?
-                };
-                let dst = shaped(self.buffers[l.dst_buf])?;
-                let m = batch * l.ho * l.wo;
-                let (scalar, grid, bindings) = match l.kind {
-                    "convert" => (
-                        batch * l.h,
-                        [batch as u32 * l.h as u32, 1, 1],
-                        vec![src, dst],
-                    ),
-                    "pool" => (m, [(batch * l.ho) as u32, 1, 1], vec![src, dst]),
-                    "reduce" => (
-                        batch,
-                        [batch as u32, 1, 1],
-                        vec![src, self.weights[&(l.name.clone() + "_b")], dst],
-                    ),
-                    _ => {
-                        let mut args = vec![
-                            src,
-                            self.weights[&l.name],
-                            self.weights[&(l.name.clone() + "_b")],
-                            dst,
-                        ];
-                        if l.extra_buf != usize::MAX {
-                            args.push(shaped(self.buffers[l.extra_buf])?);
-                        }
-                        if l.slope {
-                            args.push(self.weights[&(l.name.clone() + "_slope")]);
-                        }
-                        let m = if l.kind == "head" { batch } else { m };
-                        (
-                            m,
-                            [
-                                (if l.tile == 32 {
-                                    // The narrow kernel computes 32 channels and
-                                    // zeroes the rest of its 64-channel storage.
-                                    1
-                                } else {
-                                    l.n / if l.kind == "conv" { l.tile } else { 64 }
-                                }) as u32,
-                                m.div_ceil(64) as u32,
-                                if l.kind == "head" { l.splits as u32 } else { 1 },
-                            ],
-                            args,
-                        )
-                    }
-                };
-                let bindings = bindings
-                    .into_iter()
-                    .map(|region| {
-                        if region == dst {
-                            region.write()
-                        } else {
-                            region.read()
-                        }
-                    })
-                    .collect();
-                commands.push(Command::Dispatch(Dispatch::indices(
-                    self.kernels[kernel],
-                    [scalar as u32],
-                    grid,
-                    bindings,
-                )));
-            }
-            // Plans reject in-place activation hazards; each output above is the
-            // complete write set of its embedded kernel.
-            let outputs = self
-                .outputs
-                .iter()
-                .zip([80, 40, 20])
-                .map(|(&region, size)| {
-                    Ok((
-                        region,
-                        TensorDesc::new(DType::F16, vec![batch, size, size, 64])?
-                            .with_layout(Layout::Nhwc)?,
-                    ))
-                })
-                .collect::<hrx::Result<Vec<_>>>()?;
-            unsafe {
-                self.engine.prepare(
-                    &commands,
-                    &[(
-                        self.input,
-                        TensorDesc::new(DType::U8, vec![batch, SIZE, SIZE, 3])?
-                            .with_layout(Layout::Nhwc)?,
-                    )],
-                    &outputs,
-                    3,
-                )
-            }
+            self.fragment(batch)
+                .map_err(|error| hrx::Error::Message(error.to_string()))?
+                .prepare(3)
         })?)
+    }
+    pub fn fragment(&self, batch: usize) -> Result<ModelFragment> {
+        ensure!((1..=self.max_batch).contains(&batch), "invalid batch size");
+        let shaped = |region: Region| region.slice(0, region.len() / self.max_batch * batch);
+        let mut commands = vec![];
+        for (kernel, l) in self.ops.iter().enumerate() {
+            let src = if l.src_buf == usize::MAX {
+                shaped(self.input)?
+            } else {
+                shaped(self.buffers[l.src_buf])?
+            };
+            let dst = shaped(self.buffers[l.dst_buf])?;
+            let m = batch * l.ho * l.wo;
+            let (scalar, grid, bindings) = match l.kind {
+                "convert" => (
+                    batch * l.h,
+                    [batch as u32 * l.h as u32, 1, 1],
+                    vec![src, dst],
+                ),
+                "pool" => (m, [(batch * l.ho) as u32, 1, 1], vec![src, dst]),
+                "reduce" => (
+                    batch,
+                    [batch as u32, 1, 1],
+                    vec![src, self.weights[&(l.name.clone() + "_b")], dst],
+                ),
+                _ => {
+                    let mut args = vec![
+                        src,
+                        self.weights[&l.name],
+                        self.weights[&(l.name.clone() + "_b")],
+                        dst,
+                    ];
+                    if l.extra_buf != usize::MAX {
+                        args.push(shaped(self.buffers[l.extra_buf])?);
+                    }
+                    if l.slope {
+                        args.push(self.weights[&(l.name.clone() + "_slope")]);
+                    }
+                    let m = if l.kind == "head" { batch } else { m };
+                    (
+                        m,
+                        [
+                            (if l.tile == 32 {
+                                // The narrow kernel computes 32 channels and
+                                // zeroes the rest of its 64-channel storage.
+                                1
+                            } else {
+                                l.n / if l.kind == "conv" { l.tile } else { 64 }
+                            }) as u32,
+                            m.div_ceil(64) as u32,
+                            if l.kind == "head" { l.splits as u32 } else { 1 },
+                        ],
+                        args,
+                    )
+                }
+            };
+            let bindings = bindings
+                .into_iter()
+                .map(|region| {
+                    if region == dst {
+                        region.write()
+                    } else {
+                        region.read()
+                    }
+                })
+                .collect();
+            commands.push(Command::Dispatch(Dispatch::indices(
+                self.kernels[kernel],
+                [scalar as u32],
+                grid,
+                bindings,
+            )));
+        }
+        // Plans reject in-place activation hazards; each output above is the
+        // complete write set of its embedded kernel.
+        let outputs = self
+            .outputs
+            .iter()
+            .zip([80, 40, 20])
+            .map(|(&region, size)| {
+                Ok((
+                    region,
+                    TensorDesc::new(DType::F16, vec![batch, size, size, 64])?
+                        .with_layout(Layout::Nhwc)?,
+                ))
+            })
+            .collect::<hrx::Result<Vec<_>>>()?;
+        unsafe {
+            Ok(self.engine.fragment(
+                &commands,
+                &[(
+                    self.input,
+                    TensorDesc::new(DType::U8, vec![batch, SIZE, SIZE, 3])?
+                        .with_layout(Layout::Nhwc)?,
+                )],
+                &outputs,
+            )?)
+        }
     }
 }
 fn specification(l: &Op) -> (&'static str, Specialization) {
@@ -248,6 +252,7 @@ fn specification(l: &Op) -> (&'static str, Specialization) {
             put("splits", l.splits);
         }
         _ => {
+            put("n_stride", l.cout_stride);
             put("k_size", l.k);
             put("n_size", l.n);
             if l.kind == "conv" || l.variant == "add_resized" {

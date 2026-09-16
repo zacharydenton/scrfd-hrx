@@ -10,8 +10,10 @@ pub mod postprocess;
 use anyhow::{Result, ensure};
 pub use detection::{Detection, DetectionOptions, Image, Ranking};
 use hrx::{
+    execution::{Graph, MemoryPlacement},
     image::{ImageOps, RgbResize},
-    inference::{Inference, ModelContext},
+    inference::{Inference, InferenceGraph, ModelContext, PreparedModel},
+    plan_cache::PlanCache,
     tensor::{DType, DeviceTensor, Layout, TensorDesc},
 };
 use std::path::Path;
@@ -34,6 +36,8 @@ pub struct Scrfd {
     cnn: cnn::Cnn,
     postprocess: postprocess::Postprocess,
     images: ImageOps,
+    image_plans: PlanCache<(Vec<[usize; 2]>, u32, usize), PreparedModel>,
+    boxed_plans: PlanCache<(usize, u32, usize), PreparedModel>,
 }
 impl Scrfd {
     /// Load the pinned pretrained model from the Hugging Face cache, fetching it
@@ -64,6 +68,8 @@ impl Scrfd {
         ensure!((1..=64).contains(&max_batch), "max_batch must be 1..=64");
         Ok(Self {
             images: ImageOps::new(context, 8)?,
+            image_plans: PlanCache::new(8, PreparedModel::is_idle)?,
+            boxed_plans: PlanCache::new(8, PreparedModel::is_idle)?,
             cnn: cnn::Cnn::new(model::load(path.as_ref())?, context, max_batch)?,
             postprocess: postprocess::Postprocess::new(context)?,
         })
@@ -101,6 +107,22 @@ impl Scrfd {
             .cnn
             .prepare(desc.shape()[0])?
             .submit(std::slice::from_ref(canvases))?)
+    }
+
+    /// Record the detector CNN into a caller-owned graph, binding canvases
+    /// directly and returning three resident head tensors. Outputs become valid
+    /// after that graph executes; no private pool or ingress copy is inserted.
+    pub fn record_heads(
+        &self,
+        graph: &mut Graph,
+        canvases: &DeviceTensor,
+    ) -> Result<Vec<DeviceTensor>> {
+        self.context().validate(canvases)?;
+        let batch = canvases.desc().shape().first().copied().unwrap_or(0);
+        Ok(self
+            .cnn
+            .fragment(batch)?
+            .record(graph, std::slice::from_ref(canvases))?)
     }
     /// Decode on GPU, select on CPU using compact scores/boxes, then gather
     /// resident detections. Waits for candidate metadata, not final row readback.
@@ -145,6 +167,148 @@ impl Scrfd {
     pub fn detect(&self, image: Image<'_>, options: DetectionOptions) -> Result<Vec<Detection>> {
         Ok(self.detect_batch(&[image], options)?.remove(0))
     }
+    fn prepare_images(
+        &self,
+        shapes: &[[usize; 2]],
+        options: DetectionOptions,
+    ) -> Result<std::sync::Arc<PreparedModel>> {
+        Ok(self.image_plans.get_or_prepare(
+            (
+                shapes.to_vec(),
+                options.threshold.to_bits(),
+                options.max_candidates.min(16800),
+            ),
+            || {
+                let decode = self
+                    .postprocess
+                    .fragment(shapes.len(), options)
+                    .map_err(|e| hrx::Error::Message(e.to_string()))?;
+                let metadata = self.metadata(shapes)?;
+                let cnn = self
+                    .cnn
+                    .fragment(shapes.len())
+                    .map_err(|error| hrx::Error::Message(error.to_string()))?;
+                let resizes = shapes
+                    .chunk_by(|a, b| a == b)
+                    .map(|group| {
+                        let [width, height] = group[0];
+                        let desc = TensorDesc::new(DType::U8, vec![group.len(), height, width, 3])?
+                            .with_layout(Layout::Nhwc)?;
+                        let resize = RgbResize::letterbox(height, width, SIZE, SIZE, false)?;
+                        Ok((
+                            desc.clone(),
+                            self.images.resize_rgb_fragment(&desc, resize)?,
+                        ))
+                    })
+                    .collect::<hrx::Result<Vec<_>>>()?;
+                PreparedModel::prepare(self.context(), 3, |context| {
+                    let mut graph = context.runtime().graph();
+                    let mut inputs = Vec::with_capacity(shapes.len());
+                    let mut resized = Vec::with_capacity(shapes.len());
+                    for (desc, resize) in &resizes {
+                        let input =
+                            context.allocate_with(desc.clone(), MemoryPlacement::HostVisible)?;
+                        resized.push(
+                            resize
+                                .record(&mut graph, std::slice::from_ref(&input))?
+                                .remove(0),
+                        );
+                        // The API still accepts separate byte slices; input views
+                        // pack equal-sized images directly into one batched allocation.
+                        let shape = desc.shape();
+                        let image_desc =
+                            TensorDesc::new(DType::U8, vec![1, shape[1], shape[2], 3])?
+                                .with_layout(Layout::Nhwc)?;
+                        for i in 0..shape[0] {
+                            inputs.push(input.view(i * image_desc.bytes(), image_desc.clone())?);
+                        }
+                    }
+                    let canvases = if resized.len() == 1 {
+                        resized.remove(0)
+                    } else {
+                        let canvases = context.allocate(
+                            TensorDesc::new(DType::U8, vec![shapes.len(), SIZE, SIZE, 3])?
+                                .with_layout(Layout::Nhwc)?,
+                        )?;
+                        let destination = canvases.binding().unwrap();
+                        let mut start = 0;
+                        for image in &resized {
+                            let end = start + image.desc().bytes();
+                            graph.copy(destination.slice(start..end)?, image.binding().unwrap())?;
+                            start = end;
+                        }
+                        canvases
+                    };
+                    let mut heads = cnn.record(&mut graph, &[canvases])?;
+                    heads.push(metadata.clone());
+                    let outputs = decode.record(&mut graph, &heads)?;
+                    Ok(InferenceGraph {
+                        inputs,
+                        outputs,
+                        graph: graph.prepare()?,
+                    })
+                })
+            },
+        )?)
+    }
+    fn metadata(&self, shapes: &[[usize; 2]]) -> hrx::Result<DeviceTensor> {
+        let mut values = Vec::with_capacity(shapes.len() * 3);
+        for &[width, height] in shapes {
+            let geometry = RgbResize::letterbox(height, width, SIZE, SIZE, false)?;
+            values.extend([
+                geometry.region[3] as f32 / height as f32,
+                (width / 2) as f32,
+                (height / 2) as f32,
+            ]);
+        }
+        self.context().upload(
+            TensorDesc::new(DType::F32, vec![shapes.len(), 3])?,
+            bytemuck::cast_slice(&values),
+        )
+    }
+    fn prepare_letterboxed(
+        &self,
+        batch: usize,
+        options: DetectionOptions,
+    ) -> Result<std::sync::Arc<PreparedModel>> {
+        Ok(self.boxed_plans.get_or_prepare(
+            (
+                batch,
+                options.threshold.to_bits(),
+                options.max_candidates.min(16800),
+            ),
+            || {
+                let cnn = self
+                    .cnn
+                    .fragment(batch)
+                    .map_err(|e| hrx::Error::Message(e.to_string()))?;
+                let decoder = self
+                    .postprocess
+                    .fragment(batch, options)
+                    .map_err(|e| hrx::Error::Message(e.to_string()))?;
+                PreparedModel::prepare(self.context(), 3, |context| {
+                    let canvas = context.allocate_with(
+                        TensorDesc::new(DType::U8, vec![batch, SIZE, SIZE, 3])?
+                            .with_layout(Layout::Nhwc)?,
+                        MemoryPlacement::HostVisible,
+                    )?;
+                    let metadata = context.allocate_with(
+                        TensorDesc::new(DType::F32, vec![batch, 3])?,
+                        MemoryPlacement::HostVisible,
+                    )?;
+                    let mut graph = context.runtime().graph();
+                    let mut heads = cnn.record(&mut graph, std::slice::from_ref(&canvas))?;
+                    heads.push(metadata.clone());
+                    let outputs = decoder.record(&mut graph, &heads)?;
+                    Ok(InferenceGraph {
+                        inputs: vec![canvas, metadata],
+                        outputs,
+                        graph: graph.prepare()?,
+                    })
+                })
+            },
+        )?)
+    }
     pub fn detect_batch(
         &self,
         images: &[Image<'_>],
@@ -156,32 +320,16 @@ impl Scrfd {
         }
         let mut out = Vec::with_capacity(images.len());
         for chunk in images.chunks(self.cnn.max_batch) {
-            let mut canvases = self.context().allocate(
-                TensorDesc::new(DType::U8, vec![chunk.len(), SIZE, SIZE, 3])?
-                    .with_layout(Layout::Nhwc)?,
-            )?;
-            let mut scales = Vec::with_capacity(chunk.len());
-            for (index, image) in chunk.iter().enumerate() {
-                let geometry = RgbResize::letterbox(image.height, image.width, SIZE, SIZE, false)?;
-                let input = TensorDesc::new(DType::U8, vec![1, image.height, image.width, 3])?
-                    .with_layout(Layout::Nhwc)?;
-                let resized = self
-                    .images
-                    .prepare_resize_rgb(&input, geometry)?
-                    .acquire_blocking()?
-                    .submit_host(&[image.rgb])?;
-                self.context().copy_into(
-                    &mut canvases,
-                    index * SIZE * SIZE * 3,
-                    &resized.outputs()[0],
-                )?;
-                scales.push(geometry.region[3] as f32 / image.height as f32);
-            }
             let shapes = chunk
                 .iter()
                 .map(|i| [i.width, i.height])
                 .collect::<Vec<_>>();
-            out.extend(self.submit(&canvases, &scales, &shapes, options)?.wait()?);
+            let inputs: Vec<_> = chunk.iter().map(|image| image.rgb).collect();
+            let decoded = self
+                .prepare_images(&shapes, options)?
+                .acquire_blocking()?
+                .submit_host(&inputs)?;
+            out.extend(self.postprocess.finish_host(decoded, &shapes, options)?);
         }
         Ok(out)
     }
@@ -212,20 +360,20 @@ impl Scrfd {
             .enumerate()
         {
             let batch = chunk.len() / (SIZE * SIZE * 3);
-            let heads = self
-                .cnn
-                .prepare(batch)?
-                .acquire_blocking()?
-                .submit_host(&[chunk])?;
             let start = chunk_index * self.cnn.max_batch;
+            let chunk_shapes = &shapes[start..start + batch];
+            let metadata: Vec<f32> = scales[start..start + batch]
+                .iter()
+                .zip(chunk_shapes)
+                .flat_map(|(&scale, shape)| [scale, (shape[0] / 2) as f32, (shape[1] / 2) as f32])
+                .collect();
+            let decoded = self
+                .prepare_letterboxed(batch, options)?
+                .acquire_blocking()?
+                .submit_host(&[chunk, bytemuck::cast_slice(&metadata)])?;
             out.extend(
-                self.decode_heads(
-                    heads.outputs(),
-                    &scales[start..start + batch],
-                    &shapes[start..start + batch],
-                    options,
-                )?
-                .wait()?,
+                self.postprocess
+                    .finish_host(decoded, chunk_shapes, options)?,
             );
         }
         Ok(out)
