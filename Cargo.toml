@@ -10,7 +10,7 @@ include = ["src/**", "kernels/**", "tests/**", "docs/**", "Cargo.toml", "Cargo.l
 
 [dependencies]
 hf-hub = { version = "1.0", default-features = false, features = ["blocking", "rustls-tls"] }
-hrx = { package = "hrx-rs", version = "0.4.0", default-features = false, features = ["download", "loom"] }
+hrx = { package = "hrx-rs", version = "0.4.1", default-features = false, features = ["download", "loom"] }
 anyhow = "1"
 half = { version = "2", features = ["bytemuck"] }
 bytemuck = "1"

@@ -2,7 +2,6 @@
 //! are returned in original-image coordinates.
 mod cnn;
 pub mod detection;
-mod engine;
 pub mod hub;
 mod model;
 mod onnx;
@@ -65,7 +64,7 @@ impl Scrfd {
     /// Compare resident graph replay and direct dispatch, excluding preprocessing and transfers.
     pub fn benchmark(&mut self, image: Image<'_>, samples: usize) -> Result<ForwardTimings> {
         self.detect(image, DetectionOptions::default())?;
-        self.cnn.engine.benchmark(1, samples)
+        Ok(self.cnn.engine.benchmark(1, samples)?)
     }
     pub fn detect(
         &mut self,
@@ -165,7 +164,7 @@ impl Scrfd {
 #[cfg(test)]
 mod tests;
 
-pub use engine::{Distribution, ForwardTimings};
+pub use hrx::loom::model::{Distribution, ForwardTimings};
 
 #[cfg(test)]
 mod reference;

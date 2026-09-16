@@ -2,34 +2,38 @@ use super::*;
 #[test]
 #[ignore = "requires gfx1151"]
 fn rgb_conversion_and_padding() -> Result<()> {
-    use crate::engine::{Engine, Launch};
-    use hrx::loom::Specialization;
+    use hrx::loom::{
+        Specialization,
+        model::{Command, Dispatch, ModelSession},
+    };
 
-    let mut engine = Engine::new(0)?;
-    let input = engine.allocate_io(32 * 3)?;
-    let output = engine.allocate_io(32 * 8 * 2)?;
+    let mut engine = ModelSession::open_for(0, "gfx1151")?;
+    let input = engine.allocate_shared(32 * 3)?;
+    let output = engine.allocate_shared(32 * 8 * 2)?;
     let mut spec = Specialization::new("scrfd_hwc_u8_to_nhwc_f16");
     spec.config
         .insert("scrfd.hwc_u8_to_nhwc_f16.size".into(), "16".into());
-    engine.compile(&[(include_str!("../kernels/hwc_u8_to_nhwc_f16.loom"), spec)])?;
-    engine.record(
-        1,
-        &[Launch {
-            kernel: 0,
-            scalar: 2,
-            grid: [2, 1, 1],
-            bindings: vec![input, output],
-            output: output.buffer,
-        }],
-    )?;
+    let kernels =
+        unsafe { engine.compile(&[(include_str!("../kernels/hwc_u8_to_nhwc_f16.loom"), spec)])? };
+    unsafe {
+        engine.record(
+            1,
+            &[Command::Dispatch(Dispatch::indices(
+                kernels[0],
+                [2],
+                [2, 1, 1],
+                vec![input.read(), output.write()],
+            ))],
+        )?;
+    }
     // Unequal channels catch accidental RGB/BGR reversal. Replay with changed
     // colors also checks that every channel, including padding, is overwritten.
     for seed in [0, 73] {
         let rgb: Vec<u8> = (0..32 * 3).map(|i| ((i * 37 + seed) % 256) as u8).collect();
         engine.upload(input, &rgb)?;
-        engine.upload(output, &vec![0xff; output.bytes])?;
+        engine.upload(output, &vec![0xff; output.len()])?;
         engine.replay(1)?;
-        let mut bytes = vec![0u8; output.bytes];
+        let mut bytes = vec![0u8; output.len()];
         engine.read_many(&mut [(output, &mut bytes)])?;
         for (p, pixel) in bytes.chunks_exact(16).enumerate() {
             for (c, value) in pixel.chunks_exact(2).enumerate() {

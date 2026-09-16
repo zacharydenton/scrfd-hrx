@@ -1,28 +1,29 @@
-use crate::{
-    engine::{Engine, Launch, Region},
-    plan::{Op, Plan},
-};
+use crate::plan::{Op, Plan};
 use anyhow::{Result, ensure};
-use hrx::loom::Specialization;
+use hrx::loom::{
+    Specialization,
+    model::{Command, Dispatch, KernelId, ModelSession, Region},
+};
 use std::collections::HashMap;
 pub(crate) struct Cnn {
-    pub engine: Engine,
+    pub engine: ModelSession,
     pub input: Region,
     pub outputs: Vec<Region>,
     pub max_batch: usize,
     ops: Vec<Op>,
     buffers: Vec<Region>,
     weights: HashMap<String, Region>,
+    kernels: Vec<KernelId>,
 }
 impl Cnn {
     pub fn new(mut plan: Plan, device: i32, max_batch: usize) -> Result<Self> {
         ensure!((1..=64).contains(&max_batch), "max_batch must be 1..=64");
-        let mut engine = Engine::new(device)?;
+        let mut engine = ModelSession::open_for(device, "gfx1151")?;
         let mut weights = HashMap::new();
         for (name, data) in plan.weights {
             weights.insert(name, engine.weight(&data)?);
         }
-        let input = engine.allocate_io(max_batch * SIZE * SIZE * 3)?;
+        let input = engine.allocate_shared(max_batch * SIZE * SIZE * 3)?;
         // Keep terminal outputs separate from the device-local activation pool.
         // The original liveness plan may reuse these slots for earlier layers.
         for output in &mut plan.outputs {
@@ -41,15 +42,16 @@ impl Cnn {
             .enumerate()
             .map(|(i, n)| {
                 if plan.outputs.contains(&i) {
-                    engine.allocate_io(n * max_batch)
+                    engine.allocate_shared(n * max_batch)
                 } else {
                     engine.allocate(n * max_batch)
                 }
             })
-            .collect::<Result<Vec<_>>>()?;
+            .collect::<std::result::Result<Vec<_>, _>>()?;
         let outputs = plan.outputs.iter().map(|i| buffers[*i]).collect();
         let specs = plan.ops.iter().map(specification).collect::<Vec<_>>();
-        engine.compile(&specs)?;
+        // Every source is embedded in this crate and its bindings are declared below.
+        let kernels = unsafe { engine.compile(&specs)? };
         Ok(Self {
             engine,
             input,
@@ -58,6 +60,7 @@ impl Cnn {
             ops: plan.ops,
             buffers,
             weights,
+            kernels,
         })
     }
     pub fn run(&mut self, input: &[u8]) -> Result<usize> {
@@ -67,8 +70,8 @@ impl Cnn {
         );
         let batch = input.len() / (SIZE * SIZE * 3);
         ensure!((1..=self.max_batch).contains(&batch), "invalid batch size");
-        if !self.engine.graphs.contains_key(&batch) {
-            let mut launches = vec![];
+        if !self.engine.is_recorded(batch) {
+            let mut commands = vec![];
             for (kernel, l) in self.ops.iter().enumerate() {
                 let src = if l.src_buf == usize::MAX {
                     self.input
@@ -120,15 +123,26 @@ impl Cnn {
                         )
                     }
                 };
-                launches.push(Launch {
-                    kernel,
-                    scalar: scalar as u32,
+                let bindings = bindings
+                    .into_iter()
+                    .map(|region| {
+                        if region == dst {
+                            region.write()
+                        } else {
+                            region.read()
+                        }
+                    })
+                    .collect();
+                commands.push(Command::Dispatch(Dispatch::indices(
+                    self.kernels[kernel],
+                    [scalar as u32],
                     grid,
                     bindings,
-                    output: dst.buffer,
-                });
+                )));
             }
-            self.engine.record(batch, &launches)?;
+            // Plans reject in-place activation hazards; each output above is the
+            // complete write set of its embedded kernel.
+            unsafe { self.engine.record(batch, &commands)? };
         }
         self.engine.upload(self.input, input)?;
         self.engine.replay(batch)?;
