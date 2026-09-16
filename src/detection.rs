@@ -67,12 +67,14 @@ impl DetectionOptions {
     }
 }
 /// Aspect-preserving resize with black padding at the right and bottom.
-pub fn letterbox(image: Image<'_>) -> Result<(Vec<u8>, f32)> {
+#[cfg(test)]
+pub(crate) fn letterbox(image: Image<'_>) -> Result<(Vec<u8>, f32)> {
     let mut out = vec![0; 640 * 640 * 3];
     let scale = letterbox_into(image, &mut out, &mut fast_image_resize::Resizer::new())?;
     Ok((out, scale))
 }
-pub(crate) fn letterbox_into(
+#[cfg(test)]
+fn letterbox_into(
     image: Image<'_>,
     out: &mut [u8],
     resizer: &mut fast_image_resize::Resizer,
@@ -102,6 +104,7 @@ pub(crate) fn letterbox_into(
     resizer.resize(&source, &mut cropped, &options)?;
     Ok(h as f32 / image.height as f32)
 }
+#[cfg(test)]
 pub(crate) fn decode(
     heads: &[Vec<half::f16>],
     batch: usize,
@@ -165,10 +168,65 @@ pub(crate) fn decode(
             }
         }
     }
-    Ok(suppress(candidates, shape, options))
+    Ok(suppress_reference(candidates, shape, options))
 }
 /// Inclusive-coordinate greedy NMS, followed by optional InsightFace ranking.
 pub fn suppress(
+    candidates: Vec<Detection>,
+    shape: [usize; 2],
+    options: DetectionOptions,
+) -> Vec<Detection> {
+    let compact: Vec<_> = candidates
+        .iter()
+        .map(|d| [d.score, d.bbox[0], d.bbox[1], d.bbox[2], d.bbox[3]])
+        .collect();
+    select_candidates(&compact, shape, options)
+        .into_iter()
+        .map(|i| candidates[i].clone())
+        .collect()
+}
+
+/// Select original row indices using only scores and boxes. Coordinates needed
+/// by downstream models need not cross the device/host boundary.
+pub(crate) fn select_candidates(
+    candidates: &[[f32; 5]],
+    shape: [usize; 2],
+    options: DetectionOptions,
+) -> Vec<usize> {
+    let mut order: Vec<_> = (0..candidates.len()).collect();
+    order.sort_by(|&a, &b| candidates[b][0].total_cmp(&candidates[a][0]));
+    let bbox = |i: usize| <&[f32; 4]>::try_from(&candidates[i][1..]).unwrap();
+    let mut kept = Vec::new();
+    for i in order {
+        if kept
+            .iter()
+            .all(|&j| iou(bbox(i), bbox(j)) <= options.nms_threshold)
+        {
+            kept.push(i);
+        }
+    }
+    if options.max_detections > 0 && kept.len() > options.max_detections {
+        let rank = |i: usize| {
+            let b = bbox(i);
+            let area = (b[2] - b[0]) * (b[3] - b[1]);
+            match options.ranking {
+                Ranking::Area => area,
+                Ranking::AreaAndCenter => {
+                    area - 2.
+                        * (((b[0] + b[2]) / 2. - (shape[0] / 2) as f32).powi(2)
+                            + ((b[1] + b[3]) / 2. - (shape[1] / 2) as f32).powi(2))
+                }
+            }
+        };
+        kept.sort_by(|&a, &b| rank(b).total_cmp(&rank(a)));
+        kept.truncate(options.max_detections);
+    }
+    kept
+}
+
+// Frozen pre-migration host oracle, independent of the indexed selector.
+#[cfg(test)]
+fn suppress_reference(
     mut candidates: Vec<Detection>,
     shape: [usize; 2],
     options: DetectionOptions,

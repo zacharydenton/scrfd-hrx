@@ -9,7 +9,7 @@ repository = "https://github.com/zacharydenton/scrfd-hrx"
 include = ["src/**", "kernels/**", "tests/**", "docs/**", "Cargo.toml", "Cargo.lock", "README.md", "CHANGELOG.md", "LICENSE", "THIRD_PARTY_NOTICES.md"]
 
 [dependencies]
-hrx = { package = "hrx-rs", version = "0.5.0", default-features = false, features = ["download", "loom"] }
+hrx = { package = "hrx-rs", version = "0.6.0" }
 anyhow = "1"
 half = { version = "2", features = ["bytemuck"] }
 bytemuck = "1"
@@ -18,9 +18,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 
-fast_image_resize = "=5.1.4"
-
 [dev-dependencies]
+fast_image_resize = "=5.1.4"
 tempfile = "3"
 matrixmultiply = "0.3"
 onnx-protobuf = "0.2.3"

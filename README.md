@@ -45,6 +45,23 @@ landmarks to [arcface-hrx](https://github.com/zacharydenton/arcface-hrx).
 640×640 RGB canvases. `max_batch` defaults to 16 (range 1–64).
 `DetectionOptions` controls score filtering, NMS and result limits.
 
+Decoding and candidate compaction run on the GPU. Stable NMS and result ranking
+run on the CPU using only candidate scores and boxes (20 bytes per candidate).
+Selected indices go back to a shared HRX row gather; landmarks remain resident.
+Host detection additionally downloads the selected full rows, not dense CNN heads.
+Exceeding `max_candidates` is an error, not silent truncation; non-finite model
+predictions are also rejected.
+
+For shared-context pipelines, `submit` accepts resident letterboxed canvases
+and returns `postprocess::Detections`. Submission waits for candidate metadata
+and CPU selection, then enqueues asynchronous gathering. Its `rows` are packed
+F32 `[total_faces,16]`; `counts` waits for gathering and returns per-image counts;
+`landmarks` returns checked resident views directly usable by ArcFace. `wait`
+downloads selected rows. Both `detect_batch` and resident `letterbox` use shared GPU integer
+bilinear resize, byte-exact against the former CPU implementation on the tested
+fixtures. The hybrid path preserves stable score ties and greedy NMS ordering;
+see [postprocessing qualification](docs/postprocessing-qualification.md).
+
 ## Weights
 
 Weights are cached from a pinned revision of

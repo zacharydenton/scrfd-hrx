@@ -38,7 +38,7 @@ fn main() -> Result<()> {
     let image = image::load_from_memory(&input)?.to_rgb8();
     let (width, height) = image.dimensions();
     let rgb = image.into_raw();
-    let mut model = Scrfd::load(
+    let model = Scrfd::load(
         &model_path,
         Options {
             device: args.device,
@@ -59,7 +59,7 @@ fn main() -> Result<()> {
             )?)?
         );
     }
-    let mut run = || {
+    let run = || {
         model.detect(
             Image {
                 rgb: &rgb,

@@ -1,12 +1,16 @@
 use crate::plan::{Op, Plan};
 use anyhow::{Result, ensure};
 use hrx::{
+    inference::{ModelContext, PreparedModel},
     loom::Specialization,
-    model::{Command, Dispatch, KernelId, ModelSession, Region},
+    model::{Command, Dispatch, KernelId, ModelDefinition, ModelSession, Region},
+    plan_cache::PlanCache,
+    tensor::{DType, Layout, TensorDesc},
 };
 use std::collections::HashMap;
 pub(crate) struct Cnn {
-    pub engine: ModelSession,
+    pub engine: ModelDefinition,
+    plans: PlanCache<usize, PreparedModel>,
     pub input: Region,
     pub outputs: Vec<Region>,
     pub max_batch: usize,
@@ -16,9 +20,14 @@ pub(crate) struct Cnn {
     kernels: Vec<KernelId>,
 }
 impl Cnn {
-    pub fn new(mut plan: Plan, device: i32, max_batch: usize) -> Result<Self> {
+    pub fn new(mut plan: Plan, context: &ModelContext, max_batch: usize) -> Result<Self> {
         ensure!((1..=64).contains(&max_batch), "max_batch must be 1..=64");
-        let mut engine = ModelSession::open_for(device, "gfx1151")?;
+        let device = context.runtime().gpu()?;
+        ensure!(
+            device.target().as_str() == "gfx1151",
+            "SCRFD requires gfx1151"
+        );
+        let mut engine = ModelSession::in_context(context)?;
         let mut weights = HashMap::new();
         for (name, data) in plan.weights {
             weights.insert(name, engine.weight(&data)?);
@@ -52,8 +61,10 @@ impl Cnn {
         let specs = plan.ops.iter().map(specification).collect::<Vec<_>>();
         // Every source is embedded in this crate and its bindings are declared below.
         let kernels = unsafe { engine.compile(&specs)? };
+        let engine = engine.freeze(context)?;
         Ok(Self {
             engine,
+            plans: PlanCache::new(8, PreparedModel::is_idle)?,
             input,
             outputs,
             max_batch,
@@ -63,22 +74,18 @@ impl Cnn {
             kernels,
         })
     }
-    pub fn run(&mut self, input: &[u8]) -> Result<usize> {
-        ensure!(
-            input.len().is_multiple_of(SIZE * SIZE * 3),
-            "input must contain complete {SIZE}×{SIZE} RGB images"
-        );
-        let batch = input.len() / (SIZE * SIZE * 3);
+    pub fn prepare(&self, batch: usize) -> Result<std::sync::Arc<PreparedModel>> {
         ensure!((1..=self.max_batch).contains(&batch), "invalid batch size");
-        if !self.engine.is_recorded(batch) {
+        Ok(self.plans.get_or_prepare(batch, || {
+            let shaped = |region: Region| region.slice(0, region.len() / self.max_batch * batch);
             let mut commands = vec![];
             for (kernel, l) in self.ops.iter().enumerate() {
                 let src = if l.src_buf == usize::MAX {
-                    self.input
+                    shaped(self.input)?
                 } else {
-                    self.buffers[l.src_buf]
+                    shaped(self.buffers[l.src_buf])?
                 };
-                let dst = self.buffers[l.dst_buf];
+                let dst = shaped(self.buffers[l.dst_buf])?;
                 let m = batch * l.ho * l.wo;
                 let (scalar, grid, bindings) = match l.kind {
                     "convert" => (
@@ -100,7 +107,7 @@ impl Cnn {
                             dst,
                         ];
                         if l.extra_buf != usize::MAX {
-                            args.push(self.buffers[l.extra_buf]);
+                            args.push(shaped(self.buffers[l.extra_buf])?);
                         }
                         if l.slope {
                             args.push(self.weights[&(l.name.clone() + "_slope")]);
@@ -142,11 +149,31 @@ impl Cnn {
             }
             // Plans reject in-place activation hazards; each output above is the
             // complete write set of its embedded kernel.
-            unsafe { self.engine.record(batch, &commands)? };
-        }
-        self.engine.upload(self.input, input)?;
-        self.engine.replay(batch)?;
-        Ok(batch)
+            let outputs = self
+                .outputs
+                .iter()
+                .zip([80, 40, 20])
+                .map(|(&region, size)| {
+                    Ok((
+                        region,
+                        TensorDesc::new(DType::F16, vec![batch, size, size, 64])?
+                            .with_layout(Layout::Nhwc)?,
+                    ))
+                })
+                .collect::<hrx::Result<Vec<_>>>()?;
+            unsafe {
+                self.engine.prepare(
+                    &commands,
+                    &[(
+                        self.input,
+                        TensorDesc::new(DType::U8, vec![batch, SIZE, SIZE, 3])?
+                            .with_layout(Layout::Nhwc)?,
+                    )],
+                    &outputs,
+                    3,
+                )
+            }
+        })?)
     }
 }
 fn specification(l: &Op) -> (&'static str, Specialization) {
