@@ -1124,9 +1124,9 @@ dependencies = [
 
 [[package]]
 name = "hrx-rs"
-version = "0.7.0"
+version = "0.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9754613f80506843ec3c3d691c0dbc81ce419512de4dbfc306fff986e1b56b50"
+checksum = "4d4184d66a4522e902fda073b0dcddc9fce069bbbfa41f86ddf54e8917f3e336"
 dependencies = [
  "flate2",
  "hf-hub",

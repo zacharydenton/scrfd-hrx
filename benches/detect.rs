@@ -91,6 +91,74 @@ fn detect(c: &mut Criterion) {
     }
 
     group.finish();
+
+    // Single-call latency is not the pass's throughput. `Analysis.Gpu` keeps
+    // `@in_flight_per_model` batches outstanding, so the model overlaps one
+    // batch's GPU work with the next one's staging; `iter` never does. This
+    // measures images a second at that depth, which is the number the pass is
+    // judged on.
+    let mut group = c.benchmark_group("detect_throughput");
+    group.sample_size(20);
+
+    let model = std::sync::Arc::new(
+        Scrfd::load(
+            &path,
+            Options {
+                device: 0,
+                max_batch: 16,
+            },
+        )
+        .expect("load"),
+    );
+    let canvases = std::sync::Arc::new(canvas.repeat(16));
+    let scales = std::sync::Arc::new(vec![scale; 16]);
+    let shapes = std::sync::Arc::new(vec![shape; 16]);
+
+    for in_flight in [1usize, 2, 3] {
+        // Batches per sample, enough that thread start-up is not the measurement.
+        let batches = 8;
+        group.throughput(criterion::Throughput::Elements((batches * 16) as u64));
+        group.bench_with_input(
+            BenchmarkId::from_parameter(in_flight),
+            &in_flight,
+            |b, &in_flight| {
+                b.iter_custom(|iterations| {
+                    let start = std::time::Instant::now();
+                    for _ in 0..iterations {
+                        std::thread::scope(|scope| {
+                            for worker in 0..in_flight {
+                                let (model, canvases, scales, shapes) = (
+                                    model.clone(),
+                                    canvases.clone(),
+                                    scales.clone(),
+                                    shapes.clone(),
+                                );
+                                scope.spawn(move || {
+                                    let mine = batches / in_flight
+                                        + usize::from(worker < batches % in_flight);
+                                    for _ in 0..mine {
+                                        black_box(
+                                            model
+                                                .detect_letterboxed(
+                                                    &canvases,
+                                                    &scales,
+                                                    &shapes,
+                                                    DetectionOptions::default(),
+                                                )
+                                                .expect("detect"),
+                                        );
+                                    }
+                                });
+                            }
+                        });
+                    }
+                    start.elapsed()
+                })
+            },
+        );
+    }
+
+    group.finish();
 }
 
 criterion_group!(benches, detect);

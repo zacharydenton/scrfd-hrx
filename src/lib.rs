@@ -124,6 +124,51 @@ impl Scrfd {
             .fragment(batch)?
             .record(graph, std::slice::from_ref(canvases))?)
     }
+    /// Record resident RGB letterboxing, CNN and candidate decoding together.
+    /// The image is bound directly, without private inference-slot copies.
+    /// CPU NMS is a separate explicit boundary on the returned bindings.
+    pub fn record_image(
+        &self,
+        graph: &mut Graph,
+        image: &DeviceTensor,
+        options: DetectionOptions,
+    ) -> Result<postprocess::RecordedDetections> {
+        self.context().validate(image)?;
+        options.validate()?;
+        let shape = image.desc().shape();
+        ensure!(
+            shape.len() == 4 && (1..=self.cnn.max_batch).contains(&shape[0]),
+            "invalid image batch"
+        );
+        let shapes = vec![[shape[2], shape[1]]; shape[0]];
+        let geometry = RgbResize::letterbox(shape[1], shape[2], SIZE, SIZE, false)?;
+        let canvas = self
+            .images
+            .resize_rgb_fragment(image.desc(), geometry)?
+            .record(graph, std::slice::from_ref(image))?
+            .remove(0);
+        self.record_letterboxed(graph, &canvas, &self.metadata(&shapes)?, options)
+    }
+
+    /// Compose CNN and candidate decoding over caller-prepared canvases.
+    /// Metadata is runtime F32 `[batch,3]`: scale, original width/2 (integer
+    /// division), original height/2. The caller supplies original shapes at NMS.
+    pub fn record_letterboxed(
+        &self,
+        graph: &mut Graph,
+        canvases: &DeviceTensor,
+        metadata: &DeviceTensor,
+        options: DetectionOptions,
+    ) -> Result<postprocess::RecordedDetections> {
+        options.validate()?;
+        let mut heads = self.record_heads(graph, canvases)?;
+        heads.push(metadata.clone());
+        let outputs = self
+            .postprocess
+            .fragment(canvases.desc().shape()[0], options)?
+            .record(graph, &heads)?;
+        Ok(postprocess::RecordedDetections { outputs, options })
+    }
     /// Decode on GPU, select on CPU using compact scores/boxes, then gather
     /// resident detections. Waits for candidate metadata, not final row readback.
     pub fn decode_heads(

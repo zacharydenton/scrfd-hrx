@@ -187,11 +187,18 @@ impl Postprocess {
         shapes: &[[usize; 2]],
         options: DetectionOptions,
     ) -> Result<Selected> {
+        let outputs = decoded.wait()?;
+        Self::select_outputs(&outputs, shapes, options)
+    }
+    fn select_outputs(
+        outputs: &[DeviceTensor],
+        shapes: &[[usize; 2]],
+        options: DetectionOptions,
+    ) -> Result<Selected> {
         options.validate()?;
         let capacity = options.max_candidates.min(16800);
         // Keep the inference lease until selection and any host row reads finish.
         // These terminal buffers are coherent; no dense readback/copy is needed.
-        let outputs = decoded.wait()?;
         let status_binding = outputs[0].binding().unwrap();
         let status = status_binding.map_read()?;
         ensure!(
@@ -261,6 +268,40 @@ impl Postprocess {
                     })
                     .collect()
             })
+            .collect())
+    }
+}
+
+/// Decoder bindings recorded into a caller-owned graph. No execution or copy
+/// is performed by construction; keep this object with that prepared graph.
+pub struct RecordedDetections {
+    pub(crate) outputs: Vec<DeviceTensor>,
+    pub(crate) options: DetectionOptions,
+}
+impl RecordedDetections {
+    /// Dense candidate rows for direct GPU gathering in a downstream graph.
+    pub fn rows(&self) -> &DeviceTensor {
+        &self.outputs[1]
+    }
+
+    /// The explicit CPU control boundary. Wait for the graph execution that
+    /// wrote these bindings, map only status and score/box summaries, and
+    /// return row indices. Landmarks and image pixels are not read by the CPU.
+    pub fn select(
+        &self,
+        completion: &hrx::Completion,
+        shapes: &[[usize; 2]],
+    ) -> Result<Vec<Vec<usize>>> {
+        ensure!(
+            shapes.iter().all(|shape| !shape.contains(&0)),
+            "invalid image shapes"
+        );
+        completion.wait()?;
+        let selected = Postprocess::select_outputs(&self.outputs, shapes, self.options)?;
+        Ok(selected
+            .offsets
+            .windows(2)
+            .map(|range| selected.indices[range[0]..range[1]].to_vec())
             .collect())
     }
 }

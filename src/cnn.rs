@@ -155,6 +155,8 @@ impl Cnn {
         }
         // Plans reject in-place activation hazards; each output above is the
         // complete write set of its embedded kernel.
+        // Activation kernels initialize their padded lanes before consumers
+        // read them; private scratch needs no initial zero values.
         let outputs = self
             .outputs
             .iter()
@@ -168,15 +170,18 @@ impl Cnn {
             })
             .collect::<hrx::Result<Vec<_>>>()?;
         unsafe {
-            Ok(self.engine.fragment(
-                &commands,
-                &[(
-                    self.input,
-                    TensorDesc::new(DType::U8, vec![batch, SIZE, SIZE, 3])?
-                        .with_layout(Layout::Nhwc)?,
-                )],
-                &outputs,
-            )?)
+            Ok(self
+                .engine
+                .fragment(
+                    &commands,
+                    &[(
+                        self.input,
+                        TensorDesc::new(DType::U8, vec![batch, SIZE, SIZE, 3])?
+                            .with_layout(Layout::Nhwc)?,
+                    )],
+                    &outputs,
+                )?
+                .reuse_private_scratch())
         }
     }
 }
