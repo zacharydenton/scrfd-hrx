@@ -170,6 +170,14 @@ impl Postprocess {
             bytemuck::cast_slice(&metadata),
         )?);
         let decoded = plan.submit(&inputs)?;
+        self.finish_resident(decoded, shapes, options)
+    }
+    pub(crate) fn finish_resident(
+        &self,
+        decoded: Inference,
+        shapes: &[[usize; 2]],
+        options: DetectionOptions,
+    ) -> Result<Detections> {
         let selected = self.select(decoded, shapes, options)?;
         let rows = self
             .tensors

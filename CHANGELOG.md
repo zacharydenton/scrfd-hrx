@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Compose resident-canvas CNN inference and candidate decoding in the existing
+  cached plan, removing the separate heads submission and copies. Preserve CPU
+  selection/NMS and validate changed inputs against independently decoded heads.
+
 - Use HRX 0.7 to compose resize, inference and parallel candidate decoding in
   one graph with directly mapped IO. Retain stable CPU selection/NMS.
 - Cache threshold/capacity-specific decode plans and preserve candidate order,

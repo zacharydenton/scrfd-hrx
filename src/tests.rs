@@ -947,6 +947,39 @@ fn detect_batch_uses_shared_decoder_with_cached_options() -> Result<()> {
                 detection::decode(heads, 0, scale, [image.width, image.height], options)
             })
             .collect::<Result<Vec<_>>>()?;
+        // Resident canvases use the same fused CNN/decoder plan. Compare
+        // changing face/blank inputs against the independently decoded heads,
+        // then replay through warm slots without preparing another graph.
+        for ((image, &scale), expected) in images.iter().zip(&scales).zip(&expected) {
+            let (canvas, _) = detection::letterbox(*image)?;
+            let tensor = model.context().upload(
+                hrx::tensor::TensorDesc::new(hrx::tensor::DType::U8, vec![1, SIZE, SIZE, 3])?
+                    .with_layout(hrx::tensor::Layout::Nhwc)?,
+                &canvas,
+            )?;
+            let run = || {
+                model
+                    .submit(&tensor, &[scale], &[[image.width, image.height]], options)?
+                    .wait()
+            };
+            assert_eq!(
+                serde_json::to_value(run()?.remove(0))?,
+                serde_json::to_value(expected)?
+            );
+            let before = model.context().runtime().statistics();
+            assert_eq!(
+                serde_json::to_value(run()?.remove(0))?,
+                serde_json::to_value(expected)?
+            );
+            assert_eq!(
+                model
+                    .context()
+                    .runtime()
+                    .statistics()
+                    .native_graphs_prepared,
+                before.native_graphs_prepared
+            );
+        }
         assert_eq!(
             serde_json::to_value(model.detect_batch(&images, options)?)?,
             serde_json::to_value(&expected)?

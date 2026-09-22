@@ -188,8 +188,39 @@ impl Scrfd {
         shapes: &[[usize; 2]],
         options: DetectionOptions,
     ) -> Result<postprocess::Detections> {
-        let heads = self.submit_heads(canvases)?;
-        self.decode_heads(heads.outputs(), scales, shapes, options)
+        options.validate()?;
+        self.context().validate(canvases)?;
+        let desc = canvases.desc();
+        ensure!(
+            desc.dtype() == DType::U8
+                && desc.layout() == Layout::Nhwc
+                && desc.is_contiguous()
+                && desc.shape().len() == 4
+                && desc.shape()[1..] == [SIZE, SIZE, 3],
+            "expected contiguous NHWC uint8 640×640 canvases"
+        );
+        let batch = desc.shape()[0];
+        ensure!(
+            (1..=self.cnn.max_batch).contains(&batch)
+                && scales.len() == batch
+                && shapes.len() == batch
+                && scales.iter().all(|s| s.is_finite() && *s > 0.)
+                && shapes.iter().all(|s| s[0] > 0 && s[1] > 0),
+            "invalid image scales or shapes"
+        );
+        let values: Vec<f32> = scales
+            .iter()
+            .zip(shapes)
+            .flat_map(|(&scale, shape)| [scale, (shape[0] / 2) as f32, (shape[1] / 2) as f32])
+            .collect();
+        let metadata = self.context().upload(
+            TensorDesc::new(DType::F32, vec![batch, 3])?,
+            bytemuck::cast_slice(&values),
+        )?;
+        let decoded = self
+            .prepare_letterboxed(batch, options)?
+            .submit(&[canvases.clone(), metadata])?;
+        self.postprocess.finish_resident(decoded, shapes, options)
     }
     /// Warm synchronized host latency, including preprocessing, transfers and decode.
     pub fn benchmark(
