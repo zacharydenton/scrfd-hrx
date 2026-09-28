@@ -269,7 +269,7 @@ fn native_reference_and_replay() -> Result<()> {
 }
 #[test]
 fn malformed_onnx_returns_errors() {
-    use onnx_protobuf::{GraphProto, Message, ModelProto, NodeProto, ValueInfoProto};
+    use hrx::artifacts::onnx::proto::{GraphProto, Message, ModelProto, NodeProto, ValueInfoProto};
     assert!(onnx::Network::from_bytes(&[], 112).is_err());
     assert!(onnx::Network::from_bytes(&[0x3a, 0xff], 112).is_err());
     let node = NodeProto {
@@ -295,7 +295,7 @@ fn malformed_onnx_returns_errors() {
 
 #[test]
 fn malformed_operator_ranks_return_errors() -> Result<()> {
-    use onnx_protobuf::{
+    use hrx::artifacts::onnx::proto::{
         AttributeProto, GraphProto, Message, ModelProto, NodeProto, ValueInfoProto,
     };
     let ints = |name: &str, values: &[i64]| AttributeProto {
@@ -367,7 +367,7 @@ fn malformed_operator_ranks_return_errors() -> Result<()> {
 #[test]
 #[ignore = "requires pretrained weights; CPU model import"]
 fn importer_rejects_modified_head_pipelines() -> Result<()> {
-    use onnx_protobuf::{Message, ModelProto, NodeProto, TensorProto};
+    use hrx::artifacts::onnx::proto::{Message, ModelProto, NodeProto, TensorProto};
     let original = ModelProto::parse_from_bytes(&std::fs::read(model_path()?)?)?;
     let dir = tempfile::tempdir()?;
     let path = dir.path().join("modified.onnx");
