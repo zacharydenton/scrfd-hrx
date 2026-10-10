@@ -32,3 +32,10 @@ for a local model.
 `--offline` or `HF_HUB_OFFLINE=1` requires cached weights. `HF_HOME` and
 `HF_HUB_CACHE` select the cache location. `HRX_OFFLINE=1` separately disables
 runtime downloads.
+
+## Runtime
+
+Requires HRX 0.10.1. Graph preparation evaluates each Loom kernel's compiled
+launch metadata; cached inference reuses the resulting commands. Kernel tile
+sizes and workgroup dimensions have one source of truth in Loom. Convolution
+and projection accumulators remain FP32.
