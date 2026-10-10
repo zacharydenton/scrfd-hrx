@@ -1,22 +1,29 @@
 # scrfd-hrx
 
-SCRFD face detection in Rust for AMD GPUs, powered by
-[HRX](https://github.com/zacharydenton/hrx-rs). Library and CLI for InsightFace's
-`det_10g` model, returning bounding boxes, scores and five facial landmarks.
+SCRFD face detection in Rust, using [Loom](https://github.com/ROCm/hrx-system)
+kernels and [HRX](https://github.com/zacharydenton/hrx-rs) on AMD Strix Halo.
+Runs InsightFace's `det_10g` model and returns boxes, scores and five landmarks.
 
-Requires Rust 1.91+, Linux x86-64, glibc 2.43+ and a Radeon 8060S (`gfx1151`).
-The runtime and pretrained weights download automatically on first use.
+Warm detection measured **2.54 ms per 1080p image** and **9.06 ms per batch of four**
+on `gfx1151`. The September 2026 measurements cover RGB input through returned
+faces, excluding loading, graph preparation and image decoding.
+[Benchmark details](docs/detect-batch-2026-09-17.md).
 
-## CLI
+## Build and run
 
-```bash
+Requires Rust 1.91+, Linux x86-64, glibc 2.43+ and Radeon 8060S (`gfx1151`).
+From the checkout:
+
+```sh
 cargo run --release -- --input photo.jpg --output faces.json
 ```
 
-Reads PNG or JPEG and writes JSON. Omit `--output` to print to stdout.
-Use `--benchmark 100` for warm timings or `--max-batch 4` to reduce memory use.
+Reads PNG or JPEG and writes JSON. Omit `--output` for stdout.
+The pinned model and HRX runtime download on first use. Use `--model det_10g.onnx`
+for local weights or `--offline` for cached weights. `--benchmark 100` measures
+warm detection; `--max-batch 4` reduces resident batch capacity.
 
-## Rust
+## Rust API
 
 ```rust
 use scrfd_hrx::{DetectionOptions, Image, Options, Scrfd};
@@ -37,63 +44,25 @@ fn main() -> anyhow::Result<()> {
 }
 ```
 
-Input is packed uint8 **RGB**, resized and letterboxed to 640×640. Results use
-original-image coordinates. For face embeddings, pass the RGB image and
-landmarks to [arcface-hrx](https://github.com/zacharydenton/arcface-hrx).
-
-`detect_batch` handles multiple images; `detect_letterboxed` accepts prepared
-640×640 RGB canvases. `max_batch` defaults to 16 (range 1–64).
-`DetectionOptions` controls score filtering, NMS and result limits.
-
-Decoding and candidate compaction run on the GPU. Stable NMS and result ranking
-run on the CPU using only candidate scores and boxes (20 bytes per candidate).
-All detection entry points share this decoder and selector. `detect_batch`
-composes resizing, CNN inference and decoding into one graph per chunk. It
-reads compact metadata and selected rows directly from coherent host-visible
-storage, without copying dense CNN heads. Equal-sized consecutive images share
-batched resize storage, eliminating the canvas concatenation copy. The resident
-API gathers the selected rows on the GPU for downstream model consumption.
-Exceeding `max_candidates` is an error, not silent truncation; non-finite model
-predictions are also rejected.
-
-For shared-context pipelines, `submit` accepts resident letterboxed canvases
-and returns `postprocess::Detections`. Submission waits for candidate metadata
-and CPU selection, then enqueues asynchronous gathering. Its `rows` are packed
-F32 `[total_faces,16]`; `counts` waits for gathering and returns per-image counts;
-`landmarks` returns checked resident views directly usable by ArcFace. `wait`
-downloads selected rows. Both `detect_batch` and resident `letterbox` use shared GPU integer
-bilinear resize, byte-exact against the former CPU implementation on the tested
-fixtures. The hybrid path preserves stable score ties and greedy NMS ordering;
-see [public batch measurements](docs/detect-batch-2026-09-17.md) and
-[postprocessing qualification](docs/postprocessing-qualification.md).
-
-## Weights
-
-Weights are cached from a pinned revision of
-[immich-app/buffalo_l](https://huggingface.co/immich-app/buffalo_l/tree/d09715916a0778919a770c343533641e250b8699),
-using Hugging Face Hub. Use `--model det_10g.onnx` or `Scrfd::load(path, options)`
-for a local model.
-
-`--offline` or `HF_HUB_OFFLINE=1` requires cached weights. `HF_HOME` and
-`HF_HUB_CACHE` select the cache location. `HRX_OFFLINE=1` separately disables
-runtime downloads.
+Images are resized and letterboxed to 640×640; results use original-image
+coordinates. `detect_batch` accepts multiple images. `DetectionOptions` controls
+score thresholds, NMS and result limits. Resident outputs can feed
+[ArcFace](https://github.com/zacharydenton/arcface-hrx) in the same HRX context.
+[Batching, postprocessing and device API](docs/inference.md).
 
 ## Development
 
-```bash
+```sh
 cargo test
 cargo clippy --all-targets -- -D warnings
 cargo test --release -- --include-ignored --test-threads=1
 ```
 
-Ignored tests require model weights and, for inference, `gfx1151`. Set
-`SCRFD_MODEL` to use local weights. Run `cargo doc --open` for API docs.
-
-See [CNN batch latency and memory measurements](docs/cnn-layout-2026-09-17.md),
-[earlier kernel measurements](docs/kernels-2026-09-10.md) and the
-[changelog](CHANGELOG.md).
+Ignored tests require model weights and, for inference, `gfx1151`.
+`SCRFD_MODEL` selects local weights. [Numerical checks](docs/postprocessing-qualification.md) ·
+[Batch latency and memory](docs/cnn-layout-2026-09-17.md) · [Changelog](CHANGELOG.md)
 
 ## License
 
-[Apache-2.0](LICENSE). Model weights have separate terms; see
-[third-party notices](THIRD_PARTY_NOTICES.md).
+[Apache-2.0](LICENSE). Model weights have separate terms;
+see [third-party notices](THIRD_PARTY_NOTICES.md).
